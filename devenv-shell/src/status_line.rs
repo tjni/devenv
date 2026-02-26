@@ -299,7 +299,6 @@ impl StatusLine {
         write!(stdout, "\x1b[{};1H\x1b[2K", total_rows)?;
         stdout.write_all(&content)?;
         write!(stdout, "\x1b[0m")?;
-        stdout.flush()?;
 
         Ok(())
     }

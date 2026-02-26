@@ -769,7 +769,7 @@ impl ShellSession {
                                 pty.flush()?;
                             }
                             Event::Command(cmd) => {
-                                self.handle_command(cmd, stdout, vt, renderer)?;
+                                total_scroll += self.handle_command(cmd, vt)?;
                             }
                         }
                     }
@@ -862,7 +862,24 @@ impl ShellSession {
                 }
 
                 Event::Command(cmd) => {
-                    self.handle_command(cmd, stdout, vt, renderer)?;
+                    let scroll_count = self.handle_command(cmd, vt)?;
+                    stdout.write_all(b"\x1b[?2026h")?;
+                    if scroll_count > 0 {
+                        if renderer.row_offset > 0 {
+                            renderer.render(stdout, vt)?;
+                        } else {
+                            let content_rows = self.pty_size().rows;
+                            renderer.render_with_scroll(
+                                stdout,
+                                vt,
+                                scroll_count,
+                                content_rows,
+                            )?;
+                        }
+                    }
+                    self.draw_status_and_cursor(stdout, vt, renderer)?;
+                    stdout.write_all(b"\x1b[?2026l")?;
+                    stdout.flush()?;
                 }
             }
 
@@ -906,22 +923,21 @@ impl ShellSession {
     }
 
     /// Handle a command from the coordinator.
+    ///
+    /// Pure state update — no rendering. Returns the number of scrollback
+    /// lines produced so the caller can fold it into its render pass.
     fn handle_command(
         &mut self,
         cmd: ShellCommand,
-        stdout: &mut Box<dyn Write + Send>,
         vt: &mut Vt,
-        renderer: &mut Renderer,
-    ) -> Result<(), SessionError> {
+    ) -> Result<usize, SessionError> {
         match cmd {
             ShellCommand::ReloadReady { changed_files } => {
                 self.status_line.state_mut().set_reload_ready(changed_files);
-                self.draw_status_and_cursor(stdout, vt, renderer)?;
             }
 
             ShellCommand::Building { changed_files } => {
                 self.status_line.state_mut().set_building(changed_files);
-                self.draw_status_and_cursor(stdout, vt, renderer)?;
             }
 
             ShellCommand::BuildFailed {
@@ -931,41 +947,27 @@ impl ShellSession {
                 self.status_line
                     .state_mut()
                     .set_build_failed(changed_files, error);
-                self.draw_status_and_cursor(stdout, vt, renderer)?;
             }
 
             ShellCommand::ReloadApplied => {
                 self.status_line.state_mut().clear();
-                self.draw_status_and_cursor(stdout, vt, renderer)?;
             }
 
             ShellCommand::WatchedFiles { files } => {
                 self.status_line.state_mut().set_watched_files(files);
-                self.draw_status_and_cursor(stdout, vt, renderer)?;
             }
 
             ShellCommand::WatchingPaused { paused } => {
                 self.status_line.state_mut().set_paused(paused);
-                self.draw_status_and_cursor(stdout, vt, renderer)?;
             }
 
             ShellCommand::PrintWatchedFiles { files } => {
-                // Inject watched files list into VT so it's tracked
                 let mut text = format!("\r\n\x1b[1mWatched files ({}):\x1b[0m\r\n", files.len());
                 for file in &files {
                     text.push_str(&format!("  {}\r\n", file.display()));
                 }
-                let scroll_count = {
-                    let changes = vt.feed_str(&text);
-                    changes.scrollback.count()
-                };
-                if renderer.row_offset > 0 {
-                    renderer.render(stdout, vt)?;
-                } else {
-                    let content_rows = self.pty_size().rows;
-                    renderer.render_with_scroll(stdout, vt, scroll_count, content_rows)?;
-                }
-                self.draw_status_and_cursor(stdout, vt, renderer)?;
+                let changes = vt.feed_str(&text);
+                return Ok(changes.scrollback.count());
             }
 
             ShellCommand::Shutdown => {
@@ -977,7 +979,7 @@ impl ShellSession {
             }
         }
 
-        Ok(())
+        Ok(0)
     }
 
     /// Scan raw PTY output for escape sequences (DEC private mode and OSC queries),
@@ -1047,6 +1049,8 @@ impl ShellSession {
     }
 
     /// Draw status line and reposition cursor.
+    ///
+    /// Does not flush — callers flush after ending their sync block.
     fn draw_status_and_cursor(
         &mut self,
         stdout: &mut Box<dyn Write + Send>,
@@ -1059,7 +1063,6 @@ impl ShellSession {
             let c = vt.cursor();
             let offset = renderer.row_offset as usize;
             write!(stdout, "\x1b[{};{}H", c.row + 1 + offset, c.col + 1)?;
-            stdout.flush()?;
         }
         Ok(())
     }
