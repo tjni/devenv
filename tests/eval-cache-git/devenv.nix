@@ -9,10 +9,4 @@ in
 
   # Use the file content in the environment
   env.FILE_CONTENT = fileContent;
-
-  # Define a test that verifies the file was read
-  enterTest = ''
-    echo "File content: $FILE_CONTENT"
-    echo "Testing eval cache behavior..."
-  '';
 }
