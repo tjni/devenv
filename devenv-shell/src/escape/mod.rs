@@ -1,0 +1,583 @@
+//! Stateful byte-level scanner for escape sequences in raw PTY output.
+//!
+//! Detects DEC private mode sequences (`CSI ? <params> h/l`) and
+//! OSC queries (`OSC ... ? BEL/ST`) so they can be forwarded to
+//! the real terminal (avt consumes them internally).
+
+mod dec_mode;
+mod osc;
+
+use dec_mode::{DecModeAction, DecModeParser, DecModeResult};
+use osc::{OscParser, OscResult};
+
+/// DEC private modes that should be forwarded to the real terminal.
+const FORWARDED_MODES: &[u16] = &[
+    47, 1047, 1049, // alternate screen
+    1000, 1002, 1003, // mouse tracking
+    1005, 1006, 1015, // mouse encoding
+    2004, // bracketed paste
+    1004, // focus events
+];
+
+/// Modes that control alternate screen buffer.
+const ALT_SCREEN_MODES: &[u16] = &[47, 1047, 1049];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecModeEvent {
+    /// `CSI ? <modes> h` — set (enable) modes.
+    Set { modes: Vec<u16>, raw_bytes: Vec<u8> },
+    /// `CSI ? <modes> l` — reset (disable) modes.
+    Reset { modes: Vec<u16>, raw_bytes: Vec<u8> },
+}
+
+impl DecModeEvent {
+    /// Whether any mode in this event should be forwarded to the real terminal.
+    pub fn has_forwarded_mode(&self) -> bool {
+        let modes = match self {
+            DecModeEvent::Set { modes, .. } | DecModeEvent::Reset { modes, .. } => modes,
+        };
+        modes.iter().any(|m| FORWARDED_MODES.contains(m))
+    }
+
+    /// Whether this event enters alternate screen.
+    pub fn enters_alt_screen(&self) -> bool {
+        matches!(self, DecModeEvent::Set { modes, .. } if modes.iter().any(|m| ALT_SCREEN_MODES.contains(m)))
+    }
+
+    /// Whether this event exits alternate screen.
+    pub fn exits_alt_screen(&self) -> bool {
+        matches!(self, DecModeEvent::Reset { modes, .. } if modes.iter().any(|m| ALT_SCREEN_MODES.contains(m)))
+    }
+
+    /// Raw bytes of the original sequence for forwarding.
+    pub fn raw_bytes(&self) -> &[u8] {
+        match self {
+            DecModeEvent::Set { raw_bytes, .. } | DecModeEvent::Reset { raw_bytes, .. } => {
+                raw_bytes
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OscEvent {
+    pub raw_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SequenceEvent {
+    DecMode(DecModeEvent),
+    Osc(OscEvent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouterState {
+    Ground,
+    Esc,
+    Csi,
+    Osc,
+    /// ESC seen while in OSC — could be ST (`ESC \`) or a new sequence.
+    OscEsc,
+}
+
+/// Byte-level scanner that detects escape sequences in raw PTY output.
+///
+/// Routes `ESC [` to the DEC private mode parser and `ESC ]` to the
+/// OSC parser.
+/// State persists across calls to handle sequences split across buffer boundaries.
+pub struct EscapeScanner {
+    state: RouterState,
+    seq_bytes: Vec<u8>,
+    dec_parser: DecModeParser,
+    osc_parser: OscParser,
+}
+
+impl EscapeScanner {
+    pub fn new() -> Self {
+        Self {
+            state: RouterState::Ground,
+            seq_bytes: Vec::new(),
+            dec_parser: DecModeParser::new(),
+            osc_parser: OscParser::new(),
+        }
+    }
+
+    /// Scan a chunk of raw PTY output and return any escape sequence events found.
+    pub fn scan(&mut self, data: &[u8]) -> Vec<SequenceEvent> {
+        let mut events = Vec::new();
+
+        for &byte in data {
+            match self.state {
+                RouterState::Ground => {
+                    if byte == 0x1b {
+                        self.state = RouterState::Esc;
+                        self.seq_bytes.clear();
+                        self.seq_bytes.push(byte);
+                    }
+                }
+
+                RouterState::Esc => {
+                    self.seq_bytes.push(byte);
+                    match byte {
+                        b'[' => {
+                            self.state = RouterState::Csi;
+                            self.dec_parser.reset();
+                        }
+                        b']' => {
+                            self.state = RouterState::Osc;
+                            self.osc_parser.reset();
+                        }
+                        0x1b => {
+                            // Another ESC restarts the sequence
+                            self.seq_bytes.clear();
+                            self.seq_bytes.push(byte);
+                        }
+                        _ => {
+                            self.reset();
+                        }
+                    }
+                }
+
+                RouterState::Csi => {
+                    if byte == 0x1b {
+                        // ESC aborts current CSI, starts a new sequence
+                        self.seq_bytes.clear();
+                        self.seq_bytes.push(byte);
+                        self.state = RouterState::Esc;
+                    } else {
+                        self.seq_bytes.push(byte);
+                        match self.dec_parser.feed(byte) {
+                            DecModeResult::Pending => {}
+                            DecModeResult::Complete(action) => {
+                                let raw_bytes = std::mem::take(&mut self.seq_bytes);
+                                let event = match action {
+                                    DecModeAction::Set { modes } => {
+                                        DecModeEvent::Set { modes, raw_bytes }
+                                    }
+                                    DecModeAction::Reset { modes } => {
+                                        DecModeEvent::Reset { modes, raw_bytes }
+                                    }
+                                };
+                                events.push(SequenceEvent::DecMode(event));
+                                self.state = RouterState::Ground;
+                            }
+                            DecModeResult::Reject => {
+                                self.reset();
+                            }
+                        }
+                    }
+                }
+
+                RouterState::Osc => {
+                    if byte == 0x1b {
+                        // Could be ST (ESC \) or a new sequence
+                        self.seq_bytes.push(byte);
+                        self.state = RouterState::OscEsc;
+                    } else {
+                        self.seq_bytes.push(byte);
+                        match self.osc_parser.feed(byte) {
+                            OscResult::Pending => {}
+                            OscResult::Complete => {
+                                let raw_bytes = std::mem::take(&mut self.seq_bytes);
+                                events.push(SequenceEvent::Osc(OscEvent { raw_bytes }));
+                                self.state = RouterState::Ground;
+                            }
+                            OscResult::Reject => {
+                                self.reset();
+                            }
+                        }
+                    }
+                }
+
+                RouterState::OscEsc => {
+                    if byte == b'\\' {
+                        // ST (ESC \) terminates the OSC
+                        self.seq_bytes.push(byte);
+                        match self.osc_parser.finish() {
+                            OscResult::Complete => {
+                                let raw_bytes = std::mem::take(&mut self.seq_bytes);
+                                events.push(SequenceEvent::Osc(OscEvent { raw_bytes }));
+                                self.state = RouterState::Ground;
+                            }
+                            _ => {
+                                self.reset();
+                            }
+                        }
+                    } else if byte == 0x1b {
+                        // Another ESC — abort OSC, start new sequence
+                        self.seq_bytes.clear();
+                        self.seq_bytes.push(byte);
+                        self.state = RouterState::Esc;
+                    } else {
+                        // ESC wasn't ST — treat ESC + byte as new sequence start
+                        self.seq_bytes.clear();
+                        self.seq_bytes.push(0x1b);
+                        self.seq_bytes.push(byte);
+                        match byte {
+                            b'[' => {
+                                self.state = RouterState::Csi;
+                                self.dec_parser.reset();
+                            }
+                            b']' => {
+                                self.state = RouterState::Osc;
+                                self.osc_parser.reset();
+                            }
+                            _ => {
+                                self.reset();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        events
+    }
+
+    fn reset(&mut self) {
+        self.state = RouterState::Ground;
+        self.seq_bytes.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- DEC private mode tests --
+
+    #[test]
+    fn detects_alt_screen_enter() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[?1049h");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::DecMode(ref ev) = events[0] else {
+            panic!("expected DecMode");
+        };
+        assert!(ev.enters_alt_screen());
+        assert!(ev.has_forwarded_mode());
+        assert_eq!(ev.raw_bytes(), b"\x1b[?1049h");
+    }
+
+    #[test]
+    fn detects_alt_screen_exit() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[?1049l");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::DecMode(ref ev) = events[0] else {
+            panic!("expected DecMode");
+        };
+        assert!(ev.exits_alt_screen());
+        assert!(ev.has_forwarded_mode());
+    }
+
+    #[test]
+    fn detects_mouse_tracking() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[?1000h");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::DecMode(ref ev) = events[0] else {
+            panic!("expected DecMode");
+        };
+        assert!(ev.has_forwarded_mode());
+        assert!(!ev.enters_alt_screen());
+        match ev {
+            DecModeEvent::Set { modes, .. } => assert_eq!(modes, &[1000]),
+            _ => panic!("expected Set"),
+        }
+    }
+
+    #[test]
+    fn handles_compound_sequence() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[?1049;1006h");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::DecMode(ref ev) = events[0] else {
+            panic!("expected DecMode");
+        };
+        assert!(ev.enters_alt_screen());
+        assert!(ev.has_forwarded_mode());
+        match ev {
+            DecModeEvent::Set { modes, .. } => assert_eq!(modes, &[1049, 1006]),
+            _ => panic!("expected Set"),
+        }
+    }
+
+    #[test]
+    fn handles_split_across_buffers() {
+        let mut scanner = EscapeScanner::new();
+
+        let events1 = scanner.scan(b"\x1b[?10");
+        assert!(events1.is_empty());
+
+        let events2 = scanner.scan(b"49h");
+        assert_eq!(events2.len(), 1);
+        let SequenceEvent::DecMode(ref ev) = events2[0] else {
+            panic!("expected DecMode");
+        };
+        assert!(ev.enters_alt_screen());
+        assert_eq!(ev.raw_bytes(), b"\x1b[?1049h");
+    }
+
+    #[test]
+    fn handles_split_at_every_byte() {
+        let mut scanner = EscapeScanner::new();
+        let seq = b"\x1b[?1049h";
+        for (i, &byte) in seq.iter().enumerate() {
+            let events = scanner.scan(&[byte]);
+            if i < seq.len() - 1 {
+                assert!(events.is_empty());
+            } else {
+                assert_eq!(events.len(), 1);
+                let SequenceEvent::DecMode(ref ev) = events[0] else {
+                    panic!("expected DecMode");
+                };
+                assert!(ev.enters_alt_screen());
+            }
+        }
+    }
+
+    #[test]
+    fn ignores_non_dec_csi() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[1;31m");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn ignores_unknown_dec_modes() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[?25l");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::DecMode(ref ev) = events[0] else {
+            panic!("expected DecMode");
+        };
+        assert!(!ev.has_forwarded_mode());
+    }
+
+    #[test]
+    fn multiple_sequences_in_one_buffer() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[?1049h\x1b[?1006h");
+        assert_eq!(events.len(), 2);
+        let SequenceEvent::DecMode(ref ev0) = events[0] else {
+            panic!("expected DecMode");
+        };
+        assert!(ev0.enters_alt_screen());
+        let SequenceEvent::DecMode(ref ev1) = events[1] else {
+            panic!("expected DecMode");
+        };
+        match ev1 {
+            DecModeEvent::Set { modes, .. } => assert_eq!(modes, &[1006]),
+            _ => panic!("expected Set"),
+        }
+    }
+
+    #[test]
+    fn sequences_interleaved_with_text() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"hello\x1b[?1049hworld\x1b[?1049l");
+        assert_eq!(events.len(), 2);
+        let SequenceEvent::DecMode(ref ev0) = events[0] else {
+            panic!("expected DecMode");
+        };
+        let SequenceEvent::DecMode(ref ev1) = events[1] else {
+            panic!("expected DecMode");
+        };
+        assert!(ev0.enters_alt_screen());
+        assert!(ev1.exits_alt_screen());
+    }
+
+    #[test]
+    fn aborts_on_invalid_byte_in_params() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[?1049x");
+        assert!(events.is_empty());
+        // Scanner should be back in ground state and able to parse next sequence
+        let events = scanner.scan(b"\x1b[?1049h");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn mode_47_is_alt_screen() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[?47h");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::DecMode(ref ev) = events[0] else {
+            panic!("expected DecMode");
+        };
+        assert!(ev.enters_alt_screen());
+    }
+
+    #[test]
+    fn bracketed_paste_mode() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[?2004h");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::DecMode(ref ev) = events[0] else {
+            panic!("expected DecMode");
+        };
+        assert!(ev.has_forwarded_mode());
+        match ev {
+            DecModeEvent::Set { modes, .. } => assert_eq!(modes, &[2004]),
+            _ => panic!("expected Set"),
+        }
+    }
+
+    // -- OSC tests --
+
+    #[test]
+    fn osc_query_with_bel() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b]11;?\x07");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::Osc(ref ev) = events[0] else {
+            panic!("expected Osc");
+        };
+        assert_eq!(ev.raw_bytes, b"\x1b]11;?\x07");
+    }
+
+    #[test]
+    fn osc_query_with_st() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b]11;?\x1b\\");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::Osc(ref ev) = events[0] else {
+            panic!("expected Osc");
+        };
+        assert_eq!(ev.raw_bytes, b"\x1b]11;?\x1b\\");
+    }
+
+    #[test]
+    fn osc_non_query_ignored() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b]0;my title\x07");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn osc_split_across_buffers() {
+        let mut scanner = EscapeScanner::new();
+
+        let events1 = scanner.scan(b"\x1b]11");
+        assert!(events1.is_empty());
+
+        let events2 = scanner.scan(b";?\x07");
+        assert_eq!(events2.len(), 1);
+        let SequenceEvent::Osc(ref ev) = events2[0] else {
+            panic!("expected Osc");
+        };
+        assert_eq!(ev.raw_bytes, b"\x1b]11;?\x07");
+    }
+
+    #[test]
+    fn osc_split_at_every_byte() {
+        let mut scanner = EscapeScanner::new();
+        let seq = b"\x1b]11;?\x07";
+        for (i, &byte) in seq.iter().enumerate() {
+            let events = scanner.scan(&[byte]);
+            if i < seq.len() - 1 {
+                assert!(events.is_empty());
+            } else {
+                assert_eq!(events.len(), 1);
+                assert!(matches!(events[0], SequenceEvent::Osc(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_dec_and_osc() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[?1049h\x1b]11;?\x07\x1b[?1049l");
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], SequenceEvent::DecMode(_)));
+        assert!(matches!(events[1], SequenceEvent::Osc(_)));
+        assert!(matches!(events[2], SequenceEvent::DecMode(_)));
+    }
+
+    #[test]
+    fn osc_c0_control_rejects() {
+        let mut scanner = EscapeScanner::new();
+        // NUL in the middle of OSC payload
+        let events = scanner.scan(b"\x1b]11\x00?\x07");
+        assert!(events.is_empty());
+        // Scanner recovers
+        let events = scanner.scan(b"\x1b]11;?\x07");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn osc_various_queries() {
+        let mut scanner = EscapeScanner::new();
+        // OSC 10 (foreground color query)
+        let events = scanner.scan(b"\x1b]10;?\x07");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], SequenceEvent::Osc(_)));
+    }
+
+    // -- ESC mid-sequence recovery tests --
+
+    #[test]
+    fn esc_mid_csi_restarts_sequence() {
+        let mut scanner = EscapeScanner::new();
+        // ESC in the middle of a CSI aborts it and starts a new one
+        let events = scanner.scan(b"\x1b[?123\x1b[?1049h");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::DecMode(ref ev) = events[0] else {
+            panic!("expected DecMode");
+        };
+        assert!(ev.enters_alt_screen());
+        assert_eq!(ev.raw_bytes(), b"\x1b[?1049h");
+    }
+
+    #[test]
+    fn esc_mid_osc_starts_new_csi() {
+        let mut scanner = EscapeScanner::new();
+        // ESC [ in the middle of OSC aborts it and starts CSI
+        let events = scanner.scan(b"\x1b]11\x1b[?1049h");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::DecMode(ref ev) = events[0] else {
+            panic!("expected DecMode");
+        };
+        assert!(ev.enters_alt_screen());
+    }
+
+    #[test]
+    fn esc_mid_osc_starts_new_osc() {
+        let mut scanner = EscapeScanner::new();
+        // ESC ] in the middle of OSC aborts it and starts new OSC
+        let events = scanner.scan(b"\x1b]11\x1b]10;?\x07");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::Osc(ref ev) = events[0] else {
+            panic!("expected Osc");
+        };
+        assert_eq!(ev.raw_bytes, b"\x1b]10;?\x07");
+    }
+
+    #[test]
+    fn double_esc_restarts() {
+        let mut scanner = EscapeScanner::new();
+        // Double ESC: first is discarded, second starts sequence
+        let events = scanner.scan(b"\x1b\x1b[?1049h");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::DecMode(ref ev) = events[0] else {
+            panic!("expected DecMode");
+        };
+        assert!(ev.enters_alt_screen());
+    }
+
+    #[test]
+    fn osc_st_split_across_buffers() {
+        let mut scanner = EscapeScanner::new();
+
+        let events1 = scanner.scan(b"\x1b]11;?\x1b");
+        assert!(events1.is_empty());
+
+        let events2 = scanner.scan(b"\\");
+        assert_eq!(events2.len(), 1);
+        let SequenceEvent::Osc(ref ev) = events2[0] else {
+            panic!("expected Osc");
+        };
+        assert_eq!(ev.raw_bytes, b"\x1b]11;?\x1b\\");
+    }
+}

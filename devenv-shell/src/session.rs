@@ -3,7 +3,7 @@
 //! This module provides the main `ShellSession` type that orchestrates
 //! PTY lifecycle, terminal I/O, status line, and task execution.
 
-use crate::dec_mode::{DecModeEvent, DecModeScanner};
+use crate::escape::{DecModeEvent, EscapeScanner, SequenceEvent};
 use crate::protocol::{PtyTaskRequest, ShellCommand, ShellEvent};
 use crate::pty::{Pty, PtyError, get_terminal_size};
 use crate::status_line::{SPINNER_INTERVAL_MS, StatusLine};
@@ -625,7 +625,7 @@ impl ShellSession {
     ) -> Result<Option<u32>, SessionError> {
         let spinner_interval = Duration::from_millis(SPINNER_INTERVAL_MS);
         let mut last_resize_check = std::time::Instant::now();
-        let mut scanner = DecModeScanner::new();
+        let mut scanner = EscapeScanner::new();
         let mut in_alternate_screen = false;
         // Track forwarded modes so we can clean them up on exit
         let mut forwarded_mouse_modes: Vec<u16> = Vec::new();
@@ -714,7 +714,7 @@ impl ShellSession {
                 Event::PtyOutput(data) => {
                     // Scan for DEC private mode sequences and forward them
                     let was_in_alt = in_alternate_screen;
-                    Self::process_dec_events(
+                    Self::process_escape_events(
                         &mut scanner,
                         &data,
                         &mut in_alternate_screen,
@@ -733,7 +733,7 @@ impl ShellSession {
                     while let Ok(event) = event_rx.try_recv() {
                         match event {
                             Event::PtyOutput(more) => {
-                                Self::process_dec_events(
+                                Self::process_escape_events(
                                     &mut scanner,
                                     &more,
                                     &mut in_alternate_screen,
@@ -967,40 +967,48 @@ impl ShellSession {
         Ok(())
     }
 
-    /// Scan raw PTY output for DEC private mode sequences, forward relevant
-    /// ones to the real terminal, and update alternate screen state.
-    fn process_dec_events(
-        scanner: &mut DecModeScanner,
+    /// Scan raw PTY output for escape sequences (DEC private mode and OSC queries),
+    /// forward relevant ones to the real terminal, and update alternate screen state.
+    fn process_escape_events(
+        scanner: &mut EscapeScanner,
         data: &[u8],
         in_alternate_screen: &mut bool,
         forwarded_mouse_modes: &mut Vec<u16>,
         stdout: &mut impl Write,
     ) -> io::Result<()> {
         for event in scanner.scan(data) {
-            if !event.has_forwarded_mode() {
-                continue;
-            }
-            stdout.write_all(event.raw_bytes())?;
+            match event {
+                SequenceEvent::DecMode(event) => {
+                    if !event.has_forwarded_mode() {
+                        continue;
+                    }
+                    stdout.write_all(event.raw_bytes())?;
 
-            if event.enters_alt_screen() {
-                *in_alternate_screen = true;
-            } else if event.exits_alt_screen() {
-                *in_alternate_screen = false;
-            }
+                    if event.enters_alt_screen() {
+                        *in_alternate_screen = true;
+                    } else if event.exits_alt_screen() {
+                        *in_alternate_screen = false;
+                    }
 
-            // Track mouse modes for cleanup on exit
-            match &event {
-                DecModeEvent::Set { modes, .. } => {
-                    for &m in modes {
-                        if matches!(m, 1000 | 1002 | 1003 | 1005 | 1006 | 1015 | 2004 | 1004)
-                            && !forwarded_mouse_modes.contains(&m)
-                        {
-                            forwarded_mouse_modes.push(m);
+                    match &event {
+                        DecModeEvent::Set { modes, .. } => {
+                            for &m in modes {
+                                if matches!(
+                                    m,
+                                    1000 | 1002 | 1003 | 1005 | 1006 | 1015 | 2004 | 1004
+                                ) && !forwarded_mouse_modes.contains(&m)
+                                {
+                                    forwarded_mouse_modes.push(m);
+                                }
+                            }
+                        }
+                        DecModeEvent::Reset { modes, .. } => {
+                            forwarded_mouse_modes.retain(|m| !modes.contains(m));
                         }
                     }
                 }
-                DecModeEvent::Reset { modes, .. } => {
-                    forwarded_mouse_modes.retain(|m| !modes.contains(m));
+                SequenceEvent::Osc(event) => {
+                    stdout.write_all(&event.raw_bytes)?;
                 }
             }
         }
