@@ -9,6 +9,7 @@ use crate::pty::{Pty, PtyError, get_terminal_size};
 use crate::status_line::{SPINNER_INTERVAL_MS, StatusLine};
 use crate::task_runner::PtyTaskRunner;
 use crate::terminal::RawModeGuard;
+use crate::utf8_accumulator::Utf8Accumulator;
 use avt::Vt;
 use crossterm::terminal;
 use portable_pty::PtySize;
@@ -626,6 +627,7 @@ impl ShellSession {
         let spinner_interval = Duration::from_millis(SPINNER_INTERVAL_MS);
         let mut last_resize_check = std::time::Instant::now();
         let mut scanner = EscapeScanner::new();
+        let mut utf8_acc = Utf8Accumulator::new();
         let mut in_alternate_screen = false;
         // Track forwarded modes so we can clean them up on exit
         let mut forwarded_mouse_modes: Vec<u16> = Vec::new();
@@ -637,10 +639,12 @@ impl ShellSession {
                     event = event_rx.recv() => event,
                     _ = tokio::time::sleep(spinner_interval) => {
                         if self.config.show_status_line {
+                            stdout.write_all(b"\x1b[?2026h")?;
                             self.status_line.draw(stdout, self.size.cols, self.size.rows)?;
                             let c = vt.cursor();
                             let offset = renderer.row_offset as usize;
                             write!(stdout, "\x1b[{};{}H", c.row + 1 + offset, c.col + 1)?;
+                            stdout.write_all(b"\x1b[?2026l")?;
                             stdout.flush()?;
                         }
                         continue;
@@ -725,7 +729,8 @@ impl ShellSession {
                     // Feed output into VT and track how many lines scrolled off
                     let mut total_scroll: usize = 0;
                     {
-                        let changes = vt.feed_str(&String::from_utf8_lossy(&data));
+                        let text = utf8_acc.accumulate(&data);
+                        let changes = vt.feed_str(&text);
                         total_scroll += changes.scrollback.count();
                     }
 
@@ -740,7 +745,8 @@ impl ShellSession {
                                     &mut forwarded_mouse_modes,
                                     stdout,
                                 )?;
-                                let changes = vt.feed_str(&String::from_utf8_lossy(&more));
+                                let text = utf8_acc.accumulate(&more);
+                                let changes = vt.feed_str(&text);
                                 total_scroll += changes.scrollback.count();
                             }
                             Event::PtyExit(exit_code) => {
@@ -767,6 +773,10 @@ impl ShellSession {
                             }
                         }
                     }
+
+                    // Begin synchronized output so the terminal buffers
+                    // all writes atomically (mode 2026).
+                    stdout.write_all(b"\x1b[?2026h")?;
 
                     // Handle alternate screen transitions
                     if was_in_alt != in_alternate_screen {
@@ -836,6 +846,9 @@ impl ShellSession {
                     let c = vt.cursor();
                     let offset = renderer.row_offset as usize;
                     write!(stdout, "\x1b[{};{}H", c.row + 1 + offset, c.col + 1)?;
+
+                    // End synchronized output and flush.
+                    stdout.write_all(b"\x1b[?2026l")?;
                     stdout.flush()?;
                 }
 

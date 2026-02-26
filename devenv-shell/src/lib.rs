@@ -12,6 +12,7 @@ mod session;
 mod status_line;
 mod task_runner;
 mod terminal;
+mod utf8_accumulator;
 
 // Protocol types
 pub use protocol::{PtyTaskRequest, PtyTaskResult, ShellCommand, ShellEvent};

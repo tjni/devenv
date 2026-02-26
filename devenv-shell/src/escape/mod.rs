@@ -17,6 +17,7 @@ const FORWARDED_MODES: &[u16] = &[
     1005, 1006, 1015, // mouse encoding
     2004, // bracketed paste
     1004, // focus events
+    2026, // synchronized output
 ];
 
 /// Modes that control alternate screen buffer.
@@ -407,6 +408,21 @@ mod tests {
             panic!("expected DecMode");
         };
         assert!(ev.enters_alt_screen());
+    }
+
+    #[test]
+    fn synchronized_output_mode() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[?2026h");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::DecMode(ref ev) = events[0] else {
+            panic!("expected DecMode");
+        };
+        assert!(ev.has_forwarded_mode());
+        match ev {
+            DecModeEvent::Set { modes, .. } => assert_eq!(modes, &[2026]),
+            _ => panic!("expected Set"),
+        }
     }
 
     #[test]
