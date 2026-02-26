@@ -20,7 +20,7 @@ term_size = "0.3"
 avt = { workspace = true }
 
 # Async runtime
-tokio = { workspace = true, features = ["sync", "rt"] }
+tokio = { workspace = true, features = ["sync", "rt", "signal"] }
 
 # Error handling
 thiserror = { workspace = true }

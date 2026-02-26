@@ -281,6 +281,7 @@ enum Event {
     PtyOutput(Vec<u8>),
     PtyExit(Option<u32>),
     Command(ShellCommand),
+    Resize,
 }
 
 /// Interactive shell session with hot-reload support.
@@ -590,6 +591,23 @@ impl ShellSession {
             }
         });
 
+        // Listen for SIGWINCH to handle terminal resize immediately
+        #[cfg(unix)]
+        {
+            let resize_tx = event_tx_internal.clone();
+            tokio::spawn(async move {
+                let mut sigwinch =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+                        .expect("failed to register SIGWINCH handler");
+                loop {
+                    sigwinch.recv().await;
+                    if resize_tx.send(Event::Resize).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
         // Main event loop
         tracing::trace!("session: starting event loop");
         let exit_code = self
@@ -625,16 +643,19 @@ impl ShellSession {
         stdout: &mut Box<dyn Write + Send>,
     ) -> Result<Option<u32>, SessionError> {
         let spinner_interval = Duration::from_millis(SPINNER_INTERVAL_MS);
-        let mut last_resize_check = std::time::Instant::now();
         let mut scanner = EscapeScanner::new();
         let mut utf8_acc = Utf8Accumulator::new();
         let mut in_alternate_screen = false;
         // Track forwarded modes so we can clean them up on exit
         let mut forwarded_mouse_modes: Vec<u16> = Vec::new();
+        let mut resize_pending = false;
 
         loop {
             // Use select! to handle both events and spinner animation
-            let event = if self.status_line.state().building {
+            let event = if resize_pending {
+                resize_pending = false;
+                Some(Event::Resize)
+            } else if self.status_line.state().building {
                 tokio::select! {
                     event = event_rx.recv() => event,
                     _ = tokio::time::sleep(spinner_interval) => {
@@ -771,6 +792,10 @@ impl ShellSession {
                             Event::Command(cmd) => {
                                 total_scroll += self.handle_command(cmd, vt)?;
                             }
+                            Event::Resize => {
+                                resize_pending = true;
+                                break;
+                            }
                         }
                     }
 
@@ -869,51 +894,44 @@ impl ShellSession {
                             renderer.render(stdout, vt)?;
                         } else {
                             let content_rows = self.pty_size().rows;
-                            renderer.render_with_scroll(
-                                stdout,
-                                vt,
-                                scroll_count,
-                                content_rows,
-                            )?;
+                            renderer.render_with_scroll(stdout, vt, scroll_count, content_rows)?;
                         }
                     }
                     self.draw_status_and_cursor(stdout, vt, renderer)?;
                     stdout.write_all(b"\x1b[?2026l")?;
                     stdout.flush()?;
                 }
-            }
 
-            // Check for terminal resize periodically
-            if last_resize_check.elapsed() > Duration::from_millis(500) {
-                last_resize_check = std::time::Instant::now();
-                if let Ok((cols, rows)) = terminal::size()
-                    && (cols != self.size.cols || rows != self.size.rows)
-                {
-                    self.size = PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    };
-                    // Terminal resize ends the offset phase
-                    renderer.row_offset = 0;
-                    let pty_size = self.pty_size();
-                    let _ = pty.resize(pty_size);
-                    vt.resize(pty_size.cols as usize, pty_size.rows as usize);
-                    renderer.invalidate();
-                    renderer.render_full(stdout, vt)?;
-                    if self.config.show_status_line && !in_alternate_screen {
-                        self.status_line.draw(stdout, cols, rows)?;
+                Event::Resize => {
+                    if let Ok((cols, rows)) = terminal::size()
+                        && (cols != self.size.cols || rows != self.size.rows)
+                    {
+                        self.size = PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        };
+                        // Terminal resize ends the offset phase
+                        renderer.row_offset = 0;
+                        let pty_size = self.pty_size();
+                        let _ = pty.resize(pty_size);
+                        vt.resize(pty_size.cols as usize, pty_size.rows as usize);
+                        renderer.invalidate();
+                        renderer.render_full(stdout, vt)?;
+                        if self.config.show_status_line && !in_alternate_screen {
+                            self.status_line.draw(stdout, cols, rows)?;
+                        }
+                        let c = vt.cursor();
+                        write!(stdout, "\x1b[{};{}H", c.row + 1, c.col + 1)?;
+                        stdout.flush()?;
+                        let _ = coordinator_tx
+                            .send(ShellEvent::Resize {
+                                cols: pty_size.cols,
+                                rows: pty_size.rows,
+                            })
+                            .await;
                     }
-                    let c = vt.cursor();
-                    write!(stdout, "\x1b[{};{}H", c.row + 1, c.col + 1)?;
-                    stdout.flush()?;
-                    let _ = coordinator_tx
-                        .send(ShellEvent::Resize {
-                            cols: self.size.cols,
-                            rows: self.size.rows,
-                        })
-                        .await;
                 }
             }
         }
@@ -926,11 +944,7 @@ impl ShellSession {
     ///
     /// Pure state update — no rendering. Returns the number of scrollback
     /// lines produced so the caller can fold it into its render pass.
-    fn handle_command(
-        &mut self,
-        cmd: ShellCommand,
-        vt: &mut Vt,
-    ) -> Result<usize, SessionError> {
+    fn handle_command(&mut self, cmd: ShellCommand, vt: &mut Vt) -> Result<usize, SessionError> {
         match cmd {
             ShellCommand::ReloadReady { changed_files } => {
                 self.status_line.state_mut().set_reload_ready(changed_files);
