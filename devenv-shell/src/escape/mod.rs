@@ -69,6 +69,10 @@ pub struct OscEvent {
 pub enum SequenceEvent {
     DecMode(DecModeEvent),
     Osc(OscEvent),
+    /// CSI 3 J — erase scrollback buffer.
+    ClearScrollback {
+        raw_bytes: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +80,8 @@ enum RouterState {
     Ground,
     Esc,
     Csi,
+    /// Standard (non-DEC-private) CSI sequence: `CSI <digits> <final>`.
+    CsiStandard,
     Osc,
     /// ESC seen while in OSC — could be ST (`ESC \`) or a new sequence.
     OscEsc,
@@ -91,6 +97,8 @@ pub struct EscapeScanner {
     seq_bytes: Vec<u8>,
     dec_parser: DecModeParser,
     osc_parser: OscParser,
+    /// Accumulated numeric parameter for standard CSI sequences.
+    csi_param: u16,
 }
 
 impl EscapeScanner {
@@ -100,6 +108,7 @@ impl EscapeScanner {
             seq_bytes: Vec::new(),
             dec_parser: DecModeParser::new(),
             osc_parser: OscParser::new(),
+            csi_param: 0,
         }
     }
 
@@ -163,8 +172,37 @@ impl EscapeScanner {
                                 self.state = RouterState::Ground;
                             }
                             DecModeResult::Reject => {
-                                self.reset();
+                                // Not a DEC private mode. Try standard CSI.
+                                if byte.is_ascii_digit() {
+                                    self.state = RouterState::CsiStandard;
+                                    self.csi_param = (byte - b'0') as u16;
+                                } else {
+                                    self.reset();
+                                }
                             }
+                        }
+                    }
+                }
+
+                RouterState::CsiStandard => {
+                    if byte == 0x1b {
+                        self.seq_bytes.clear();
+                        self.seq_bytes.push(byte);
+                        self.state = RouterState::Esc;
+                    } else {
+                        self.seq_bytes.push(byte);
+                        if byte.is_ascii_digit() {
+                            self.csi_param = self
+                                .csi_param
+                                .checked_mul(10)
+                                .and_then(|v| v.checked_add((byte - b'0') as u16))
+                                .unwrap_or(u16::MAX);
+                        } else if byte == b'J' && self.csi_param == 3 {
+                            let raw_bytes = std::mem::take(&mut self.seq_bytes);
+                            events.push(SequenceEvent::ClearScrollback { raw_bytes });
+                            self.state = RouterState::Ground;
+                        } else {
+                            self.reset();
                         }
                     }
                 }
@@ -238,6 +276,7 @@ impl EscapeScanner {
     fn reset(&mut self) {
         self.state = RouterState::Ground;
         self.seq_bytes.clear();
+        self.csi_param = 0;
     }
 }
 
@@ -595,5 +634,54 @@ mod tests {
             panic!("expected Osc");
         };
         assert_eq!(ev.raw_bytes, b"\x1b]11;?\x1b\\");
+    }
+
+    // -- Clear scrollback (CSI 3 J) tests --
+
+    #[test]
+    fn detects_clear_scrollback() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[3J");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::ClearScrollback { ref raw_bytes } = events[0] else {
+            panic!("expected ClearScrollback");
+        };
+        assert_eq!(raw_bytes, b"\x1b[3J");
+    }
+
+    #[test]
+    fn clear_scrollback_split_across_buffers() {
+        let mut scanner = EscapeScanner::new();
+
+        let events1 = scanner.scan(b"\x1b[");
+        assert!(events1.is_empty());
+
+        let events2 = scanner.scan(b"3");
+        assert!(events2.is_empty());
+
+        let events3 = scanner.scan(b"J");
+        assert_eq!(events3.len(), 1);
+        assert!(matches!(events3[0], SequenceEvent::ClearScrollback { .. }));
+    }
+
+    #[test]
+    fn ignores_other_ed_params() {
+        let mut scanner = EscapeScanner::new();
+        // CSI 2 J (clear screen) should not emit ClearScrollback
+        let events = scanner.scan(b"\x1b[2J");
+        assert!(events.is_empty());
+        // Scanner recovers
+        let events = scanner.scan(b"\x1b[3J");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], SequenceEvent::ClearScrollback { .. }));
+    }
+
+    #[test]
+    fn clear_scrollback_interleaved_with_dec_mode() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[?1049h\x1b[3J");
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], SequenceEvent::DecMode(_)));
+        assert!(matches!(events[1], SequenceEvent::ClearScrollback { .. }));
     }
 }

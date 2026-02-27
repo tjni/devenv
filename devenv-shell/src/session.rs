@@ -396,9 +396,7 @@ impl ShellSession {
             }
 
             // Clear VT so internal task output (env exports, markers, drain
-            // sentinels) is not rendered to the user. The PTY resize later
-            // triggers SIGWINCH, which makes bash redraw the prompt without
-            // any clear-screen sequences.
+            // sentinels) is not rendered to the user.
             vt.feed_str("\x1b[2J\x1b[H");
 
             // Signal TUI that initial build is complete and we're ready for terminal
@@ -464,6 +462,12 @@ impl ShellSession {
         };
         tracing::debug!("session: cursor position after TUI: row {}", cursor_row);
 
+        // TUI renderers may leave a non-default scroll region/origin mode.
+        // Reset both before we start cursor-addressed rendering, otherwise
+        // the first shell draw can land in the wrong area and overlap TUI output.
+        write!(stdout, "\x1b[r\x1b[?6l")?;
+        stdout.flush()?;
+
         // Get terminal size.
         // TODO: query the size from the actual stdout fd (e.g. TIOCGWINSZ on the
         // writer) instead of crossterm::terminal::size() which always uses the
@@ -500,7 +504,13 @@ impl ShellSession {
             self.pty_size()
         };
         let _ = pty.resize(pty_size);
+
+        // Reset the VT after resize so any stale PTY output (the shell's
+        // PROMPT_COMMAND after task execution, SIGWINCH redraw from the
+        // resize above) starts on a clean slate. The event loop will
+        // process any pending PTY output normally.
         vt.resize(pty_size.cols as usize, pty_size.rows as usize);
+        vt.feed_str("\x1b[2J\x1b[H");
 
         // Initialize the renderer and do a full initial draw
         let mut renderer = Renderer::new();
@@ -1038,6 +1048,9 @@ impl ShellSession {
                 }
                 SequenceEvent::Osc(event) => {
                     stdout.write_all(&event.raw_bytes)?;
+                }
+                SequenceEvent::ClearScrollback { raw_bytes } => {
+                    stdout.write_all(&raw_bytes)?;
                 }
             }
         }
