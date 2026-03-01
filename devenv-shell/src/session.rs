@@ -86,6 +86,20 @@ fn dump_color(s: &mut String, color: avt::Color, base: u8) {
     }
 }
 
+/// Feed text into VT and return the actual number of lines that scrolled off
+/// the viewport. Unlike `changes.scrollback.count()` (which only reports lines
+/// trimmed by gc beyond the scrollback limit), this accounts for lines retained
+/// in scrollback too.
+fn feed_vt(vt: &mut Vt, text: &str) -> usize {
+    let lines_before = vt.lines().count();
+    let gc_count = {
+        let changes = vt.feed_str(text);
+        changes.scrollback.count()
+    };
+    let lines_after = vt.lines().count();
+    (lines_after + gc_count).saturating_sub(lines_before)
+}
+
 /// Differential renderer that draws VT state to a bounded terminal region.
 ///
 /// Instead of passing raw PTY output to stdout (which conflicts with the status
@@ -379,7 +393,7 @@ impl ShellSession {
         let pty = Arc::new(Pty::spawn(initial_cmd, pty_size)?);
         let mut vt = Vt::builder()
             .size(pty_size.cols as usize, pty_size.rows as usize)
-            .scrollback_limit(0)
+            .scrollback_limit(self.size.rows as usize)
             .build();
 
         // Handle TUI handoff if present
@@ -714,10 +728,7 @@ impl ShellSession {
                                     error_text.push_str(&format!("  {}\r\n", line));
                                 }
                                 error_text.push_str("\r\n");
-                                let scroll_count = {
-                                    let changes = vt.feed_str(&error_text);
-                                    changes.scrollback.count()
-                                };
+                                let scroll_count = feed_vt(vt, &error_text);
                                 if renderer.row_offset > 0 {
                                     renderer.render(stdout, vt)?;
                                 } else {
@@ -761,8 +772,7 @@ impl ShellSession {
                     let mut total_scroll: usize = 0;
                     {
                         let text = utf8_acc.accumulate(&data);
-                        let changes = vt.feed_str(&text);
-                        total_scroll += changes.scrollback.count();
+                        total_scroll += feed_vt(vt, &text);
                     }
 
                     // Batch: drain any additional pending PtyOutput events
@@ -777,8 +787,7 @@ impl ShellSession {
                                     stdout,
                                 )?;
                                 let text = utf8_acc.accumulate(&more);
-                                let changes = vt.feed_str(&text);
-                                total_scroll += changes.scrollback.count();
+                                total_scroll += feed_vt(vt, &text);
                             }
                             Event::PtyExit(exit_code) => {
                                 Self::cleanup_forwarded_modes(
@@ -990,8 +999,7 @@ impl ShellSession {
                 for file in &files {
                     text.push_str(&format!("  {}\r\n", file.display()));
                 }
-                let changes = vt.feed_str(&text);
-                return Ok(changes.scrollback.count());
+                return Ok(feed_vt(vt, &text));
             }
 
             ShellCommand::Shutdown => {
