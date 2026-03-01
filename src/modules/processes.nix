@@ -35,10 +35,6 @@ let
   parseProcessDep = import ./lib/parse-process-dep.nix { inherit lib; };
 
   processType = types.submodule ({ config, name, ... }: {
-    imports = [
-      (lib.mkRenamedOptionModule [ "enable" ] [ "start" "enable" ])
-    ];
-
     options = {
       start = lib.mkOption {
         type = types.submodule {
