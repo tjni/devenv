@@ -4,6 +4,8 @@
 //! including PTY spawning, terminal handling, status line rendering,
 //! and task execution within the shell environment.
 
+#[cfg(unix)]
+pub mod control_pipe;
 pub mod dialect;
 mod escape;
 mod protocol;
@@ -13,6 +15,10 @@ mod status_line;
 mod task_runner;
 mod terminal;
 mod utf8_accumulator;
+
+// Control pipe (unix-only: uses FIFO via libc::mkfifo and tokio::net::unix::pipe)
+#[cfg(unix)]
+pub use control_pipe::{ControlMessage, ControlPipe, ControlPipeReceiver};
 
 // Protocol types
 pub use protocol::{PtyTaskRequest, PtyTaskResult, ShellCommand, ShellEvent};

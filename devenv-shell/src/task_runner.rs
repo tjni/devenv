@@ -1,10 +1,14 @@
-//! Marker-based task execution in PTY.
+//! FIFO-based task execution in PTY.
 //!
-//! This module provides functionality to execute tasks inside a PTY shell
-//! using a marker-based protocol to delimit command output.
+//! Uses a named pipe (FIFO) as a control channel for structured messages
+//! (shell readiness, task completion with exit code) and a fence marker
+//! in PTY output for framing task output.
 
+use crate::control_pipe::{ControlMessage, ControlPipeReceiver};
 use crate::protocol::{PtyTaskRequest, PtyTaskResult};
 use crate::pty::Pty;
+use shell_escape::unix::escape;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Instant;
 use strip_ansi_escapes::strip_str;
@@ -22,108 +26,162 @@ pub enum TaskRunnerError {
     ShellNotReady,
     #[error("spawn_blocking failed: {0}")]
     SpawnBlocking(String),
+    #[error("control pipe error: {0}")]
+    ControlPipe(String),
 }
 
-/// Marker-based task execution in PTY.
+/// Validate that a string is a valid shell variable name (`[a-zA-Z_][a-zA-Z0-9_]*`).
+fn is_valid_shell_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// FIFO-based task execution in PTY.
 ///
-/// Uses echo markers to delimit command output:
+/// Uses a control pipe for structured messages and a fence marker in PTY
+/// output for output framing:
 /// ```text
-/// echo '__DEVENV_TASK_START_<id>__'
-/// <command>
-/// echo '__DEVENV_TASK_END_<id>_'$?'__'
+/// <command>; __e=$?; echo '{"type":"task_end",...}' >&3; echo __DEVENV_FENCE_<id>__
 /// ```
+///
+/// The fd 3 write happens before the fence echo, so the control message
+/// is guaranteed to be in the FIFO kernel buffer by the time we see the
+/// fence in PTY output. We then read the control pipe sequentially after
+/// fence detection.
 pub struct PtyTaskRunner {
     pty: Arc<Pty>,
+    control_rx: ControlPipeReceiver,
 }
 
 impl PtyTaskRunner {
-    /// Create a new task runner for the given PTY.
-    pub fn new(pty: Arc<Pty>) -> Self {
-        Self { pty }
+    /// Create a new task runner for the given PTY and control pipe receiver.
+    pub fn new(pty: Arc<Pty>, control_rx: ControlPipeReceiver) -> Self {
+        Self { pty, control_rx }
     }
 
-    /// Wait for shell to signal readiness.
+    /// Wait for shell to signal readiness via control pipe.
     ///
-    /// Looks for `__DEVENV_SHELL_READY__` marker in PTY output.
-    /// This should be emitted by the shell's rcfile after initialization.
-    pub async fn wait_for_shell_ready(&self) -> Result<(), TaskRunnerError> {
+    /// Concurrently drains PTY output to prevent kernel buffer fill.
+    /// When `vt` is `Some`, feeds PTY output into the virtual terminal;
+    /// when `None`, discards it.
+    pub async fn wait_for_shell_ready(
+        &mut self,
+        mut vt: Option<&mut avt::Vt>,
+    ) -> Result<(), TaskRunnerError> {
         tracing::trace!("wait_for_shell_ready: waiting for shell to be ready");
 
-        let mut init_buffer = String::new();
         loop {
             let pty_clone = Arc::clone(&self.pty);
-            let read_result = tokio::task::spawn_blocking(move || {
+            let pty_read = tokio::task::spawn_blocking(move || {
                 let mut buf = [0u8; 4096];
-                match pty_clone.read(&mut buf) {
-                    Ok(n) => Ok((buf, n)),
-                    Err(e) => Err(e),
+                pty_clone.read(&mut buf).map(|n| (buf, n))
+            });
+            tokio::pin!(pty_read);
+
+            tokio::select! {
+                msg = self.control_rx.recv() => {
+                    // Await the in-flight PTY read so no orphaned thread
+                    // holds the reader mutex after we return.
+                    let _ = pty_read.await;
+
+                    match msg {
+                        Ok(Some(ControlMessage::Ready)) => {
+                            tracing::trace!("wait_for_shell_ready: shell is ready");
+                            return Ok(());
+                        }
+                        Ok(Some(other)) => {
+                            tracing::warn!("wait_for_shell_ready: unexpected message: {:?}", other);
+                        }
+                        Ok(None) => {
+                            tracing::error!("wait_for_shell_ready: control pipe closed");
+                            return Err(TaskRunnerError::ShellNotReady);
+                        }
+                        Err(e) => {
+                            tracing::error!("wait_for_shell_ready: control pipe error: {}", e);
+                            return Err(TaskRunnerError::ControlPipe(e.to_string()));
+                        }
+                    }
                 }
-            })
-            .await;
-
-            let (buf, n) = match read_result {
-                Ok(Ok((buf, n))) => (buf, n),
-                Ok(Err(e)) => {
-                    tracing::error!("wait_for_shell_ready: PTY read error during init: {}", e);
-                    return Err(TaskRunnerError::Io(e));
+                result = &mut pty_read => {
+                    match result {
+                        Ok(Ok((buf, n))) if n > 0 => {
+                            if let Some(ref mut vt) = vt {
+                                let chunk = String::from_utf8_lossy(&buf[..n]);
+                                vt.feed_str(&chunk);
+                            }
+                            tracing::trace!("wait_for_shell_ready: read {} bytes", n);
+                        }
+                        Ok(Ok(_)) => {
+                            tracing::error!("wait_for_shell_ready: PTY closed before ready");
+                            return Err(TaskRunnerError::ShellNotReady);
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!("wait_for_shell_ready: PTY read error: {}", e);
+                            return Err(TaskRunnerError::Io(e));
+                        }
+                        Err(e) => {
+                            tracing::error!("wait_for_shell_ready: spawn_blocking failed: {}", e);
+                            return Err(TaskRunnerError::SpawnBlocking(e.to_string()));
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("wait_for_shell_ready: spawn_blocking failed: {}", e);
-                    return Err(TaskRunnerError::SpawnBlocking(e.to_string()));
-                }
-            };
-
-            if n == 0 {
-                tracing::error!("wait_for_shell_ready: PTY closed before shell ready");
-                return Err(TaskRunnerError::ShellNotReady);
-            }
-
-            let chunk = String::from_utf8_lossy(&buf[..n]);
-            init_buffer.push_str(&chunk);
-            tracing::trace!("wait_for_shell_ready: init buffer: {:?}", init_buffer);
-
-            if init_buffer.contains("__DEVENV_SHELL_READY__") {
-                tracing::trace!("wait_for_shell_ready: shell is ready");
-                return Ok(());
             }
         }
     }
 
     /// Execute a single task request and send result via response channel.
-    pub async fn execute(&self, request: PtyTaskRequest) {
+    ///
+    /// When `vt` is `Some`, feeds PTY output into the virtual terminal;
+    /// when `None`, output is only captured for the task result.
+    pub async fn execute(&mut self, request: PtyTaskRequest, mut vt: Option<&mut avt::Vt>) {
         let id = request.id;
-        let start_marker = format!("__DEVENV_TASK_START_{id}__");
-        let end_marker_prefix = format!("__DEVENV_TASK_END_{id}_");
+        let fence = format!("__DEVENV_FENCE_{id}__");
 
-        tracing::trace!("execute: task id={}, cmd={}", request.id, request.command);
+        tracing::trace!("execute: task id={}, cmd={}", id, request.command);
 
-        // Build the command to execute with markers
+        // Build command with control pipe signaling and fence
         let mut cmd_parts = Vec::new();
 
-        // Echo start marker
-        cmd_parts.push(format!("echo '{start_marker}'"));
-
-        // Set environment variables
+        // Set environment variables (validate keys to prevent shell injection)
         for (key, value) in &request.env {
-            let escaped = value.replace('\'', "'\\''");
-            cmd_parts.push(format!("export {key}='{escaped}'"));
+            if !is_valid_shell_var_name(key) {
+                tracing::warn!("execute: skipping invalid env key: {:?}", key);
+                continue;
+            }
+            let escaped = escape(Cow::Borrowed(value));
+            cmd_parts.push(format!("export {key}={escaped}"));
         }
 
         // Change directory if specified
         if let Some(ref cwd) = request.cwd {
-            cmd_parts.push(format!("cd '{cwd}'"));
+            let escaped = escape(Cow::Borrowed(cwd.as_str()));
+            cmd_parts.push(format!("cd {escaped}"));
         }
 
         // Execute the command
         cmd_parts.push(request.command.clone());
 
-        // Echo end marker with exit code
-        cmd_parts.push(format!("echo '{end_marker_prefix}'$?'__'"));
+        // Signal exit code via control pipe, then echo fence to PTY.
+        // The fd 3 write is sequential before the fence echo, so the
+        // control message is guaranteed to be in the FIFO kernel buffer
+        // by the time we see the fence in PTY output.
+        cmd_parts.push(format!(
+            "__e=$?; echo '{{\"type\":\"task_end\",\"id\":{id},\"exit_code\":'$__e'}}' >&3; echo '{fence}'"
+        ));
 
         // Join with semicolons and add newline.
         // History is disabled during task execution (set +o history in rcfile),
         // so these commands won't appear in user's shell history.
-        let full_cmd = format!("{}\n", cmd_parts.join("; "));
+        let full_cmd = if vt.is_some() {
+            // Prefix with space to prevent command from being saved to shell history
+            format!(" {}\n", cmd_parts.join("; "))
+        } else {
+            format!("{}\n", cmd_parts.join("; "))
+        };
 
         // Write command to PTY in a background task so reading can start
         // immediately. The PTY kernel buffer is only ~4-16KB on macOS; if the
@@ -138,12 +196,10 @@ impl PtyTaskRunner {
             pty_write.flush()
         });
 
-        // Read PTY output until we see the end marker
+        // Read PTY output until we see the fence
         let mut output_buffer = String::new();
         let mut stdout_lines = Vec::new();
-        let mut started = false;
         let mut error_msg: Option<String> = None;
-        let mut exit_code: Option<i32> = None;
 
         'read_loop: loop {
             let pty_clone = Arc::clone(&self.pty);
@@ -175,6 +231,9 @@ impl PtyTaskRunner {
             }
 
             let chunk = String::from_utf8_lossy(&buf[..n]);
+            if let Some(ref mut vt) = vt {
+                vt.feed_str(&chunk);
+            }
             tracing::trace!("execute: read {} bytes: {:?}", n, chunk);
             output_buffer.push_str(&chunk);
 
@@ -183,35 +242,48 @@ impl PtyTaskRunner {
                 let line = output_buffer[..newline_pos].to_string();
                 output_buffer = output_buffer[newline_pos + 1..].to_string();
 
-                // Strip ANSI codes and trim whitespace for marker detection
+                // Strip ANSI codes and trim whitespace for fence detection
                 let clean = strip_str(&line);
                 let trimmed = clean.trim();
 
-                tracing::trace!("execute: line (started={}): {:?}", started, trimmed);
+                tracing::trace!("execute: line: {:?}", trimmed);
 
-                // Check for start marker - must be exact match
-                if !started && trimmed == start_marker {
-                    tracing::trace!("execute: found start marker");
-                    started = true;
-                    continue;
-                }
-
-                // Check for end marker
-                if started && trimmed.starts_with(&end_marker_prefix) && trimmed.ends_with("__") {
-                    exit_code = trimmed
-                        .strip_prefix(&end_marker_prefix)
-                        .and_then(|s| s.strip_suffix("__"))
-                        .and_then(|s| s.parse::<i32>().ok());
-                    tracing::trace!("execute: found end marker, exit_code={:?}", exit_code);
+                // Check for fence
+                if trimmed == fence {
+                    tracing::trace!("execute: found fence");
                     break 'read_loop;
                 }
 
-                // Capture output if task has started
-                if started {
-                    stdout_lines.push((Instant::now(), line));
-                }
+                stdout_lines.push((Instant::now(), line));
             }
         }
+
+        // Get exit code from control pipe (data is in kernel buffer after fence)
+        let exit_code = if error_msg.is_none() {
+            match self.control_rx.recv().await {
+                Ok(Some(ControlMessage::TaskEnd {
+                    id: msg_id,
+                    exit_code,
+                })) if msg_id == id => {
+                    tracing::trace!("execute: got exit_code={} from control pipe", exit_code);
+                    Some(exit_code)
+                }
+                Ok(Some(other)) => {
+                    error_msg = Some(format!("unexpected control message: {:?}", other));
+                    None
+                }
+                Ok(None) => {
+                    error_msg = Some("control pipe closed".to_string());
+                    None
+                }
+                Err(e) => {
+                    error_msg = Some(format!("control pipe error: {e}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Check if the background write succeeded
         if error_msg.is_none() {
@@ -262,7 +334,7 @@ impl PtyTaskRunner {
 
     /// Restore PROMPT_COMMAND when handing control to user.
     /// History is re-enabled separately inside drain_pty_to_vt() so the
-    /// sentinel echo commands are never recorded.
+    /// fence echo commands are never recorded.
     fn restore_prompt_command(&self) -> Result<(), TaskRunnerError> {
         self.pty
             .write_all(b"PROMPT_COMMAND=\"$__devenv_saved_pc\"\n")
@@ -276,14 +348,14 @@ impl PtyTaskRunner {
 
     /// Run task loop, processing requests until channel closes.
     pub async fn run_loop(
-        &self,
+        &mut self,
         task_rx: &mut mpsc::Receiver<PtyTaskRequest>,
     ) -> Result<(), TaskRunnerError> {
         tracing::trace!("run_loop: waiting for task requests");
         self.disable_prompt_command()?;
 
         while let Some(request) = task_rx.recv().await {
-            self.execute(request).await;
+            self.execute(request, None).await;
         }
 
         self.restore_prompt_command()?;
@@ -304,13 +376,13 @@ impl PtyTaskRunner {
     /// terminal handoff. It waits for shell readiness, then processes
     /// task requests until the channel closes.
     pub async fn run_with_vt(
-        &self,
+        &mut self,
         task_rx: &mut mpsc::Receiver<PtyTaskRequest>,
         vt: &mut avt::Vt,
         pty_ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<(), TaskRunnerError> {
-        // Wait for shell to be ready before signaling task dispatch
-        self.wait_for_shell_ready_with_vt(vt).await?;
+        // Wait for shell to be ready
+        self.wait_for_shell_ready(Some(&mut *vt)).await?;
 
         if let Some(tx) = pty_ready_tx {
             let _ = tx.send(());
@@ -320,39 +392,42 @@ impl PtyTaskRunner {
         self.disable_prompt_command()?;
 
         while let Some(request) = task_rx.recv().await {
-            self.execute_with_vt(request, vt).await;
+            self.execute(request, Some(&mut *vt)).await;
         }
 
         self.restore_prompt_command()?;
 
         // Drain any pending PTY output into VT so it doesn't leak to stdout later.
-        // Uses a sentinel to deterministically consume all output without leaving
+        // Uses a single fence to deterministically consume all output without leaving
         // zombie threads that could steal future PTY reads.
         // History is still disabled at this point; the drain command itself
-        // re-enables history after the sentinels so they are never recorded.
+        // re-enables history after the fence so it is never recorded.
         self.drain_pty_to_vt(vt).await;
 
         tracing::trace!("run_with_vt: task channel closed, exiting");
         Ok(())
     }
 
-    /// Drain pending PTY output into VT using a sentinel marker.
+    /// Drain pending PTY output into VT using a fence.
     ///
-    /// Sends an echo command with a known sentinel string, then reads from the
-    /// PTY until the sentinel appears. Each read is individually awaited (no
-    /// infinite loop inside spawn_blocking), so no zombie threads are left behind
-    /// that could steal future PTY reads from the session's reader thread.
+    /// Sends the fence echo twice as separate command lines, then reads
+    /// until the fence appears twice. Reading until the second match
+    /// ensures the PROMPT_COMMAND output between them is consumed, leaving
+    /// exactly one prompt in the buffer. History is re-enabled after the
+    /// second fence so the drain commands are never recorded.
+    ///
+    /// Each read is individually awaited (no infinite loop inside
+    /// spawn_blocking), so no zombie threads are left behind that could
+    /// steal future PTY reads from the session's reader thread.
     async fn drain_pty_to_vt(&self, vt: &mut avt::Vt) {
-        let sentinel = "__DEVENV_DRAIN_DONE__";
-        // Send the sentinel echo twice as separate command lines.
-        // Reading until the second match ensures the PROMPT_COMMAND output
-        // between them is consumed, leaving exactly one prompt in the buffer.
-        // History is still disabled (set +o history from init), so the sentinel
-        // commands are not recorded. We re-enable history after the second
-        // sentinel so the drain consumes all internal command output.
-        let cmd = format!(" echo '{sentinel}'\n echo '{sentinel}'; set -o history\n");
+        let fence = "__DEVENV_DRAIN__";
+        // Two fence echos: reading until the second match consumes
+        // the PROMPT_COMMAND output between them. History is re-enabled
+        // on the same line as the second echo so its echoback is also
+        // consumed before the match.
+        let cmd = format!(" echo '{fence}'\n echo '{fence}'; set -o history\n");
         if self.pty.write_all(cmd.as_bytes()).is_err() || self.pty.flush().is_err() {
-            tracing::warn!("drain_pty_to_vt: failed to send sentinel command");
+            tracing::warn!("drain_pty_to_vt: failed to send drain command");
             return;
         }
 
@@ -363,7 +438,7 @@ impl PtyTaskRunner {
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                tracing::warn!("drain_pty_to_vt: timed out waiting for sentinel");
+                tracing::warn!("drain_pty_to_vt: timed out waiting for fence");
                 break;
             }
 
@@ -379,21 +454,19 @@ impl PtyTaskRunner {
                     vt.feed_str(&chunk);
                     total_bytes += data.len();
                     buffer.push_str(&chunk);
-                    // Check for sentinel on its own line (after stripping ANSI codes).
-                    // This avoids matching the terminal echo of the command which
-                    // contains the sentinel as part of: echo '__DEVENV_DRAIN_DONE__'
-                    // We need TWO matches (one per echo command) to consume the
+                    // Count fence matches (after stripping ANSI codes).
+                    // We need TWO matches (one per echo) to consume the
                     // PROMPT_COMMAND output between them.
                     let match_count = buffer
                         .lines()
-                        .filter(|line| strip_str(line).trim() == sentinel)
+                        .filter(|line| strip_str(line).trim() == fence)
                         .count();
                     if match_count >= 2 {
                         break;
                     }
                 }
                 _ => {
-                    tracing::warn!("drain_pty_to_vt: read failed while waiting for sentinel");
+                    tracing::warn!("drain_pty_to_vt: read failed while waiting for fence");
                     break;
                 }
             }
@@ -402,207 +475,5 @@ impl PtyTaskRunner {
         if total_bytes > 0 {
             tracing::trace!("drain_pty_to_vt: drained {} bytes", total_bytes);
         }
-    }
-
-    /// Wait for shell ready while feeding VT.
-    async fn wait_for_shell_ready_with_vt(&self, vt: &mut avt::Vt) -> Result<(), TaskRunnerError> {
-        tracing::trace!("wait_for_shell_ready_with_vt: waiting for shell to be ready");
-
-        let mut init_buffer = String::new();
-        loop {
-            let pty_clone = Arc::clone(&self.pty);
-            let read_result = tokio::task::spawn_blocking(move || {
-                let mut buf = [0u8; 4096];
-                match pty_clone.read(&mut buf) {
-                    Ok(n) => Ok((buf, n)),
-                    Err(e) => Err(e),
-                }
-            })
-            .await;
-
-            let (buf, n) = match read_result {
-                Ok(Ok((buf, n))) => (buf, n),
-                Ok(Err(e)) => {
-                    tracing::error!("wait_for_shell_ready_with_vt: PTY read error: {}", e);
-                    return Err(TaskRunnerError::Io(e));
-                }
-                Err(e) => {
-                    tracing::error!("wait_for_shell_ready_with_vt: spawn_blocking failed: {}", e);
-                    return Err(TaskRunnerError::SpawnBlocking(e.to_string()));
-                }
-            };
-
-            if n == 0 {
-                tracing::error!("wait_for_shell_ready_with_vt: PTY closed before shell ready");
-                return Err(TaskRunnerError::ShellNotReady);
-            }
-
-            let chunk = String::from_utf8_lossy(&buf[..n]);
-            vt.feed_str(&chunk);
-            init_buffer.push_str(&chunk);
-            tracing::trace!(
-                "wait_for_shell_ready_with_vt: init buffer: {:?}",
-                init_buffer
-            );
-
-            if init_buffer.contains("__DEVENV_SHELL_READY__") {
-                tracing::trace!("wait_for_shell_ready_with_vt: shell is ready");
-                return Ok(());
-            }
-        }
-    }
-
-    /// Execute a task while feeding VT.
-    async fn execute_with_vt(&self, request: PtyTaskRequest, vt: &mut avt::Vt) {
-        let id = request.id;
-        let start_marker = format!("__DEVENV_TASK_START_{id}__");
-        let end_marker_prefix = format!("__DEVENV_TASK_END_{id}_");
-
-        tracing::trace!(
-            "execute_with_vt: task id={}, cmd={}",
-            request.id,
-            request.command
-        );
-
-        // Build the command to execute with markers
-        let mut cmd_parts = Vec::new();
-        cmd_parts.push(format!("echo '{start_marker}'"));
-
-        for (key, value) in &request.env {
-            let escaped = value.replace('\'', "'\\''");
-            cmd_parts.push(format!("export {key}='{escaped}'"));
-        }
-
-        if let Some(ref cwd) = request.cwd {
-            cmd_parts.push(format!("cd '{cwd}'"));
-        }
-
-        cmd_parts.push(request.command.clone());
-        cmd_parts.push(format!("echo '{end_marker_prefix}'$?'__'"));
-
-        // Prefix with space to prevent command from being saved to shell history
-        let full_cmd = format!(" {}\n", cmd_parts.join("; "));
-
-        // Write command to PTY in a background task so reading can start
-        // immediately. The PTY kernel buffer is only ~4-16KB on macOS; if the
-        // command string (with inline exports) exceeds that, a synchronous
-        // write_all would deadlock because bash echoes input back and nobody
-        // is draining the read side.
-        tracing::trace!("execute_with_vt: writing command to PTY:\n{}", full_cmd);
-        let pty_write = Arc::clone(&self.pty);
-        let cmd_bytes = full_cmd.into_bytes();
-        let write_handle = tokio::task::spawn_blocking(move || {
-            pty_write.write_all(&cmd_bytes)?;
-            pty_write.flush()
-        });
-
-        let mut output_buffer = String::new();
-        let mut stdout_lines = Vec::new();
-        let mut started = false;
-        let mut error_msg: Option<String> = None;
-        let mut exit_code: Option<i32> = None;
-
-        'read_loop: loop {
-            let pty_clone = Arc::clone(&self.pty);
-            let read_result = tokio::task::spawn_blocking(move || {
-                let mut buf = [0u8; 4096];
-                match pty_clone.read(&mut buf) {
-                    Ok(n) => Ok((buf, n)),
-                    Err(e) => Err(e),
-                }
-            })
-            .await;
-
-            let (buf, n) = match read_result {
-                Ok(Ok((buf, n))) => (buf, n),
-                Ok(Err(e)) => {
-                    error_msg = Some(format!("PTY read error: {e}"));
-                    break 'read_loop;
-                }
-                Err(e) => {
-                    error_msg = Some(format!("spawn_blocking failed: {e}"));
-                    break 'read_loop;
-                }
-            };
-
-            if n == 0 {
-                tracing::trace!("execute_with_vt: PTY returned 0 bytes (closed)");
-                error_msg = Some("PTY closed unexpectedly".to_string());
-                break 'read_loop;
-            }
-
-            let chunk = String::from_utf8_lossy(&buf[..n]);
-            vt.feed_str(&chunk);
-            tracing::trace!("execute_with_vt: read {} bytes: {:?}", n, chunk);
-            output_buffer.push_str(&chunk);
-
-            while let Some(newline_pos) = output_buffer.find('\n') {
-                let line = output_buffer[..newline_pos].to_string();
-                output_buffer = output_buffer[newline_pos + 1..].to_string();
-
-                let clean = strip_str(&line);
-                let trimmed = clean.trim();
-
-                tracing::trace!("execute_with_vt: line (started={}): {:?}", started, trimmed);
-
-                if !started && trimmed == start_marker {
-                    tracing::trace!("execute_with_vt: found start marker");
-                    started = true;
-                    continue;
-                }
-
-                if started && trimmed.starts_with(&end_marker_prefix) && trimmed.ends_with("__") {
-                    exit_code = trimmed
-                        .strip_prefix(&end_marker_prefix)
-                        .and_then(|s| s.strip_suffix("__"))
-                        .and_then(|s| s.parse::<i32>().ok());
-                    tracing::trace!(
-                        "execute_with_vt: found end marker, exit_code={:?}",
-                        exit_code
-                    );
-                    break 'read_loop;
-                }
-
-                if started {
-                    stdout_lines.push((Instant::now(), line));
-                }
-            }
-        }
-
-        // Check if the background write succeeded
-        if error_msg.is_none() {
-            match write_handle.await {
-                Ok(Err(e)) => error_msg = Some(format!("Failed to write to PTY: {e}")),
-                Err(e) => error_msg = Some(format!("PTY write task panicked: {e}")),
-                Ok(Ok(())) => {}
-            }
-        }
-
-        let (success, error) = if let Some(err) = error_msg {
-            (false, Some(err))
-        } else {
-            let code = exit_code.unwrap_or(1);
-            (
-                code == 0,
-                if code == 0 {
-                    None
-                } else {
-                    Some(format!("Task exited with code {code}"))
-                },
-            )
-        };
-
-        tracing::trace!(
-            "execute_with_vt: result success={}, error={:?}",
-            success,
-            error
-        );
-
-        let _ = request.response_tx.send(PtyTaskResult {
-            success,
-            stdout_lines,
-            stderr_lines: Vec::new(),
-            error,
-        });
     }
 }

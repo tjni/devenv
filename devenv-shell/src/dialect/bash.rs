@@ -57,8 +57,11 @@ export PATH="$_DEVENV_PATH"
 # Hot-reload hook (keybinding and PROMPT_COMMAND integration)
 {reload_hook}
 
-# Signal that shell initialization is complete (for PTY task runner)
-echo "__DEVENV_SHELL_READY__"
+# Open control pipe for out-of-band signaling to PTY task runner
+exec 3>"$DEVENV_CONTROL_FIFO"
+
+# Signal that shell initialization is complete
+echo '{{"type":"ready"}}' >&3
 "#,
             env_diff_helpers = ctx.env_diff_helpers,
             env_script_path = ctx.env_script_path.to_string_lossy(),

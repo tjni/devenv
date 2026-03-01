@@ -20,7 +20,7 @@ term_size = "0.3"
 avt = { workspace = true }
 
 # Async runtime
-tokio = { workspace = true, features = ["sync", "rt", "signal"] }
+tokio = { workspace = true, features = ["sync", "rt", "signal", "net", "io-util"] }
 
 # Error handling
 thiserror = { workspace = true }
@@ -30,6 +30,11 @@ tracing = { workspace = true }
 
 # ANSI stripping
 strip-ansi-escapes = { workspace = true }
+
+# Serialization (control pipe messages)
+serde = { workspace = true }
+serde_json = { workspace = true }
+shell-escape = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

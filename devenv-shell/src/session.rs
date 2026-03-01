@@ -3,6 +3,7 @@
 //! This module provides the main `ShellSession` type that orchestrates
 //! PTY lifecycle, terminal I/O, status line, and task execution.
 
+use crate::control_pipe::ControlPipe;
 use crate::escape::{DecModeEvent, EscapeScanner, SequenceEvent};
 use crate::protocol::{PtyTaskRequest, ShellCommand, ShellEvent};
 use crate::pty::{Pty, PtyError, get_terminal_size};
@@ -363,7 +364,7 @@ impl ShellSession {
         io: SessionIo,
     ) -> Result<Option<u32>, SessionError> {
         // Wait for the initial Spawn command
-        let (initial_cmd, _watch_files) = match command_rx.recv().await {
+        let (mut initial_cmd, _watch_files) = match command_rx.recv().await {
             Some(ShellCommand::Spawn {
                 command,
                 watch_files,
@@ -390,17 +391,34 @@ impl ShellSession {
         // Spawn PTY early so tasks can run in it (before TUI exits)
         // Reserve 1 row for status line if enabled
         let pty_size = self.pty_size();
+
+        // Create control FIFO for out-of-band signaling between shell and task runner.
+        // Include timestamp nanos alongside PID to avoid stale file collisions
+        // (e.g. after SIGKILL where the Drop handler does not run and a new
+        // process reuses the same PID).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let fifo_path =
+            std::env::temp_dir().join(format!("devenv-ctrl-{}-{nanos}", std::process::id()));
+        let control_pipe = ControlPipe::create(fifo_path).map_err(SessionError::Io)?;
+        initial_cmd.env("DEVENV_CONTROL_FIFO", control_pipe.path());
+
         let pty = Arc::new(Pty::spawn(initial_cmd, pty_size)?);
         let mut vt = Vt::builder()
             .size(pty_size.cols as usize, pty_size.rows as usize)
             .scrollback_limit(self.size.rows as usize)
             .build();
 
+        // Open the read end of the control pipe (non-blocking, async reads via epoll)
+        let control_rx = control_pipe.into_receiver().map_err(SessionError::Io)?;
+
         // Handle TUI handoff if present
         if let Some(mut handoff) = handoff {
             // Run any tasks in the PTY (TUI still active, showing progress)
             if let Some(mut task_rx) = handoff.task_rx.take() {
-                let task_runner = PtyTaskRunner::new(Arc::clone(&pty));
+                let mut task_runner = PtyTaskRunner::new(Arc::clone(&pty), control_rx);
                 let pty_ready_tx = handoff.pty_ready_tx.take();
                 task_runner
                     .run_with_vt(&mut task_rx, &mut vt, pty_ready_tx)
@@ -410,7 +428,7 @@ impl ShellSession {
             }
 
             // Clear VT so internal task output (env exports, markers, drain
-            // sentinels) is not rendered to the user.
+            // fences) is not rendered to the user.
             vt.feed_str("\x1b[2J\x1b[H");
 
             // Signal TUI that initial build is complete and we're ready for terminal
