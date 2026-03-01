@@ -113,21 +113,12 @@ __devenv_compute_diff() {
     diff_content=$(mktemp)
     __devenv_capture_env > "$after_file"
 
-    # Extract var name from declare -p line
-    __devenv_parse_var() {
-        local line="${1#declare -x }"
-        if [[ "$line" == *=* ]]; then
-            echo "${line%%=*}"
-        else
-            echo "$line"
-        fi
-    }
-
     # Build associative arrays for before/after
     local -A before_vars after_vars
     while IFS= read -r line; do
         [[ "$line" != declare\ -x\ * ]] && continue
-        local var=$(__devenv_parse_var "$line")
+        local vardef="${line#declare -x }"
+        local var="${vardef%%=*}"
         [[ -z "$var" ]] && continue
         __devenv_ignored_var "$var" && continue
         before_vars["$var"]="$line"
@@ -135,7 +126,8 @@ __devenv_compute_diff() {
 
     while IFS= read -r line; do
         [[ "$line" != declare\ -x\ * ]] && continue
-        local var=$(__devenv_parse_var "$line")
+        local vardef="${line#declare -x }"
+        local var="${vardef%%=*}"
         [[ -z "$var" ]] && continue
         __devenv_ignored_var "$var" && continue
         after_vars["$var"]="$line"
