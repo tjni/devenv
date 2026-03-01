@@ -101,6 +101,124 @@ fn feed_vt(vt: &mut Vt, text: &str) -> usize {
     (lines_after + gc_count).saturating_sub(lines_before)
 }
 
+/// Filters OSC responses from stdin to prevent garbled text.
+///
+/// When we forward OSC queries (e.g., color scheme detection) to the real
+/// terminal, the terminal's responses arrive on stdin. If the querying
+/// program has exited before the response arrives, the response bytes
+/// would be interpreted as user input by readline. This filter removes
+/// OSC response sequences (`ESC ] <digits> ; <payload> <terminator>`)
+/// from the stdin stream while passing everything else through.
+struct StdinFilter {
+    state: StdinFilterState,
+    buf: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum StdinFilterState {
+    Ground,
+    Esc,
+    OscDigit,
+    OscPayload,
+    OscPayloadEsc,
+}
+
+impl StdinFilter {
+    fn new() -> Self {
+        Self {
+            state: StdinFilterState::Ground,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Filter a chunk of stdin data, returning only non-OSC bytes.
+    fn filter(&mut self, data: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(data.len());
+
+        for &byte in data {
+            match self.state {
+                StdinFilterState::Ground => {
+                    if byte == 0x1b {
+                        self.buf.clear();
+                        self.buf.push(byte);
+                        self.state = StdinFilterState::Esc;
+                    } else {
+                        output.push(byte);
+                    }
+                }
+                StdinFilterState::Esc => {
+                    if byte == b']' {
+                        self.buf.push(byte);
+                        self.state = StdinFilterState::OscDigit;
+                    } else if byte == 0x1b {
+                        output.push(0x1b);
+                        self.buf.clear();
+                        self.buf.push(byte);
+                    } else {
+                        output.extend_from_slice(&self.buf);
+                        output.push(byte);
+                        self.buf.clear();
+                        self.state = StdinFilterState::Ground;
+                    }
+                }
+                StdinFilterState::OscDigit => {
+                    if byte.is_ascii_digit() {
+                        self.buf.push(byte);
+                    } else if byte == b';' {
+                        self.buf.push(byte);
+                        self.state = StdinFilterState::OscPayload;
+                    } else {
+                        // Not a valid OSC response pattern, emit everything
+                        output.extend_from_slice(&self.buf);
+                        output.push(byte);
+                        self.buf.clear();
+                        self.state = StdinFilterState::Ground;
+                    }
+                }
+                StdinFilterState::OscPayload => {
+                    if byte == 0x07 {
+                        // BEL terminates OSC — drop the entire sequence
+                        self.buf.clear();
+                        self.state = StdinFilterState::Ground;
+                    } else if byte == 0x1b {
+                        self.buf.push(byte);
+                        self.state = StdinFilterState::OscPayloadEsc;
+                    } else {
+                        self.buf.push(byte);
+                        if self.buf.len() > 256 {
+                            // Safety limit: not a real OSC response, emit
+                            output.extend_from_slice(&self.buf);
+                            self.buf.clear();
+                            self.state = StdinFilterState::Ground;
+                        }
+                    }
+                }
+                StdinFilterState::OscPayloadEsc => {
+                    if byte == b'\\' {
+                        // ST (ESC \) terminates OSC — drop the entire sequence
+                        self.buf.clear();
+                        self.state = StdinFilterState::Ground;
+                    } else if byte == 0x1b {
+                        // Another ESC — give up on this OSC, start fresh
+                        output.extend_from_slice(&self.buf[..self.buf.len() - 1]);
+                        self.buf.clear();
+                        self.buf.push(byte);
+                        self.state = StdinFilterState::Esc;
+                    } else {
+                        // Not ST — not a valid OSC, emit everything
+                        output.extend_from_slice(&self.buf);
+                        output.push(byte);
+                        self.buf.clear();
+                        self.state = StdinFilterState::Ground;
+                    }
+                }
+            }
+        }
+
+        output
+    }
+}
+
 /// Differential renderer that draws VT state to a bounded terminal region.
 ///
 /// Instead of passing raw PTY output to stdout (which conflicts with the status
@@ -116,21 +234,48 @@ struct Renderer {
     /// instead of (N + 1). Gradually consumed as VT content scrolls,
     /// or reset to 0 immediately on terminal resize or alternate screen.
     row_offset: u16,
+    /// Number of usable content rows on the real terminal (excludes status line).
+    /// Used to clip rendering so offset VT rows don't overwrite the status line.
+    content_rows: u16,
 }
 
 impl Renderer {
-    fn new() -> Self {
+    fn new(content_rows: u16) -> Self {
         Self {
             prev_lines: Vec::new(),
             prev_cursor: (0, 0, true),
             row_offset: 0,
+            content_rows,
         }
     }
 
-    /// Render changed VT lines to stdout. Skips lines that haven't changed.
+    /// Number of VT rows that fit on-screen given the current offset.
+    fn visible_rows(&self) -> usize {
+        (self.content_rows as usize).saturating_sub(self.row_offset as usize)
+    }
+
+    /// Scroll the real terminal by `count` lines within a temporary DECSTBM
+    /// scroll region, pushing content into native scrollback while protecting
+    /// the status line row.
+    fn scroll_region(stdout: &mut impl Write, content_rows: u16, count: usize) -> io::Result<()> {
+        if count == 0 || content_rows == 0 {
+            return Ok(());
+        }
+        write!(stdout, "\x1b[1;{}r", content_rows)?;
+        write!(stdout, "\x1b[{};1H", content_rows)?;
+        stdout.write_all("\n".repeat(count).as_bytes())?;
+        write!(stdout, "\x1b[r")
+    }
+
+    /// Render changed VT lines to stdout. Skips lines that haven't changed
+    /// and clips rows that would fall outside the visible area.
     fn render(&mut self, stdout: &mut impl Write, vt: &Vt) -> io::Result<()> {
         let offset = self.row_offset as usize;
+        let max_row = self.visible_rows();
         for (row_idx, line) in vt.view().enumerate() {
+            if row_idx >= max_row {
+                break;
+            }
             let cells = line.cells();
             if row_idx < self.prev_lines.len() && cells == &self.prev_lines[row_idx][..] {
                 continue;
@@ -152,8 +297,8 @@ impl Renderer {
 
     /// Scroll the real terminal to push content into native scrollback, then render.
     ///
-    /// When the VT reports scrolled lines (via `Changes.scrollback`), we briefly set
-    /// a DECSTBM scroll region to protect the status line row, write newlines to scroll
+    /// When the VT reports scrolled lines (via `Changes.scrollback`), we use a
+    /// DECSTBM scroll region to protect the status line row, write newlines to scroll
     /// the real terminal, then reset the region. This pushes content into the terminal's
     /// native scrollback buffer — the same mechanism tmux uses.
     fn render_with_scroll(
@@ -161,18 +306,10 @@ impl Renderer {
         stdout: &mut impl Write,
         vt: &Vt,
         scroll_count: usize,
-        content_rows: u16,
     ) -> io::Result<()> {
-        if scroll_count > 0 && content_rows > 0 {
-            let effective = scroll_count.min(content_rows as usize);
-            // Set scroll region to content area (protects status line row below)
-            write!(stdout, "\x1b[1;{}r", content_rows)?;
-            write!(stdout, "\x1b[{};1H", content_rows)?;
-            let newlines = "\n".repeat(effective);
-            stdout.write_all(newlines.as_bytes())?;
-            // Reset scroll region to full terminal
-            write!(stdout, "\x1b[r")?;
-            // Shift prev_lines to match the scroll
+        if scroll_count > 0 {
+            let effective = scroll_count.min(self.content_rows as usize);
+            Self::scroll_region(stdout, self.content_rows, effective)?;
             if effective < self.prev_lines.len() {
                 self.prev_lines.drain(..effective);
             } else {
@@ -185,8 +322,12 @@ impl Renderer {
     /// Full redraw of all VT lines (after resize or initialization).
     fn render_full(&mut self, stdout: &mut impl Write, vt: &Vt) -> io::Result<()> {
         let offset = self.row_offset as usize;
+        let max_row = self.visible_rows();
         self.prev_lines.clear();
         for (row_idx, line) in vt.view().enumerate() {
+            if row_idx >= max_row {
+                break;
+            }
             write!(stdout, "\x1b[{};1H\x1b[2K", row_idx + 1 + offset)?;
             stdout.write_all(dump_line(line).as_bytes())?;
             write!(stdout, "\x1b[0m")?;
@@ -520,21 +661,13 @@ impl ShellSession {
             self.size.cols,
             self.size.rows
         );
-        // Resize PTY/VT to match current terminal size.
-        // When offset > 0, shrink to fit in the available space below cursor_row
-        // so VT content doesn't overlap with the status line.
+        // Both PTY and VT stay at full terminal size so that:
+        // - Programs see the real dimensions (no unnecessary pager invocations)
+        // - Alternate screen save/restore works correctly (same buffer size)
+        // The renderer clips output to the visible area below cursor_row
+        // and gradually consumes offset as the cursor moves down.
         let row_offset = cursor_row.saturating_sub(1);
-        let pty_size = if row_offset > 0 {
-            let available_rows = self.pty_size().rows.saturating_sub(row_offset).max(1);
-            PtySize {
-                rows: available_rows,
-                cols: self.size.cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            }
-        } else {
-            self.pty_size()
-        };
+        let pty_size = self.pty_size();
         let _ = pty.resize(pty_size);
 
         // Reset the VT after resize so any stale PTY output (the shell's
@@ -545,12 +678,8 @@ impl ShellSession {
         vt.feed_str("\x1b[2J\x1b[H");
 
         // Initialize the renderer and do a full initial draw
-        let mut renderer = Renderer::new();
+        let mut renderer = Renderer::new(pty_size.rows);
         if row_offset > 0 {
-            // Preserve existing screen content by offsetting VT rows below it.
-            // The prompt will appear at cursor_row. Old content stays visible
-            // until VT output fills the available space and triggers a scroll,
-            // at which point old content is pushed into native scrollback.
             renderer.row_offset = row_offset;
             renderer.sync(&vt);
         } else {
@@ -686,6 +815,7 @@ impl ShellSession {
     ) -> Result<Option<u32>, SessionError> {
         let spinner_interval = Duration::from_millis(SPINNER_INTERVAL_MS);
         let mut scanner = EscapeScanner::new();
+        let mut stdin_filter = StdinFilter::new();
         let mut utf8_acc = Utf8Accumulator::new();
         let mut in_alternate_screen = false;
         // Track forwarded modes so we can clean them up on exit
@@ -750,13 +880,7 @@ impl ShellSession {
                                 if renderer.row_offset > 0 {
                                     renderer.render(stdout, vt)?;
                                 } else {
-                                    let content_rows = self.pty_size().rows;
-                                    renderer.render_with_scroll(
-                                        stdout,
-                                        vt,
-                                        scroll_count,
-                                        content_rows,
-                                    )?;
+                                    renderer.render_with_scroll(stdout, vt, scroll_count)?;
                                 }
                             } else {
                                 pty.write_all(&[0x0C])?;
@@ -771,8 +895,11 @@ impl ShellSession {
                         }
                         continue;
                     }
-                    pty.write_all(&data)?;
-                    pty.flush()?;
+                    let filtered = stdin_filter.filter(&data);
+                    if !filtered.is_empty() {
+                        pty.write_all(&filtered)?;
+                        pty.flush()?;
+                    }
                 }
 
                 Event::PtyOutput(data) => {
@@ -813,18 +940,15 @@ impl ShellSession {
                                     &forwarded_mouse_modes,
                                     stdout,
                                 )?;
-                                let content_rows = self.pty_size().rows;
-                                renderer.render_with_scroll(
-                                    stdout,
-                                    vt,
-                                    total_scroll,
-                                    content_rows,
-                                )?;
+                                renderer.render_with_scroll(stdout, vt, total_scroll)?;
                                 return Ok(exit_code);
                             }
                             Event::Stdin(stdin_data) => {
-                                pty.write_all(&stdin_data)?;
-                                pty.flush()?;
+                                let filtered = stdin_filter.filter(&stdin_data);
+                                if !filtered.is_empty() {
+                                    pty.write_all(&filtered)?;
+                                    pty.flush()?;
+                                }
                             }
                             Event::Command(cmd) => {
                                 total_scroll += self.handle_command(cmd, vt)?;
@@ -845,60 +969,31 @@ impl ShellSession {
                         renderer.invalidate();
                     }
 
-                    if in_alternate_screen {
-                        // Alternate screen apps (vim, less) need the full terminal.
-                        // Immediately consume all offset so VT gets full size.
-                        if renderer.row_offset > 0 {
-                            renderer.row_offset = 0;
-                            let full_pty_size = self.pty_size();
-                            let _ = pty.resize(full_pty_size);
-                            vt.resize(full_pty_size.cols as usize, full_pty_size.rows as usize);
-                            renderer.invalidate();
-                        }
-                        renderer.render(stdout, vt)?;
-                    } else if renderer.row_offset > 0 {
-                        if total_scroll > 0 {
-                            // Gradually consume offset: push old content rows
-                            // into scrollback and grow VT by the same amount.
-                            // This keeps the cursor near the bottom instead of
-                            // jumping to the middle on a sudden full expansion.
-                            let consumed = total_scroll.min(renderer.row_offset as usize);
-                            let remaining = total_scroll - consumed;
-                            let full_content_rows = self.pty_size().rows;
+                    // Consume offset if needed: when cursor would land
+                    // off-screen or VT scrolled, push old TUI content
+                    // into native scrollback to make room.
+                    if renderer.row_offset > 0 {
+                        let content_rows = renderer.content_rows;
+                        let visible_rows = renderer.visible_rows();
+                        let cursor_excess = (vt.cursor().row + 1).saturating_sub(visible_rows);
+                        let need = total_scroll.max(cursor_excess);
 
-                            // Push consumed rows of old content into scrollback
-                            write!(stdout, "\x1b[1;{}r", full_content_rows)?;
-                            write!(stdout, "\x1b[{};1H", full_content_rows)?;
-                            stdout.write_all("\n".repeat(consumed).as_bytes())?;
-                            write!(stdout, "\x1b[r")?;
-
-                            // Shrink offset and grow VT to match
-                            renderer.row_offset -= consumed as u16;
-                            let new_vt_rows = full_content_rows - renderer.row_offset;
-                            let new_pty_size = PtySize {
-                                rows: new_vt_rows,
-                                cols: self.size.cols,
-                                pixel_width: 0,
-                                pixel_height: 0,
-                            };
-                            let _ = pty.resize(new_pty_size);
-                            vt.resize(new_pty_size.cols as usize, new_pty_size.rows as usize);
-
-                            // Full repaint (DECSTBM scroll invalidated alignment)
-                            renderer.invalidate();
-                            renderer.render_with_scroll(
-                                stdout,
-                                vt,
-                                remaining,
-                                full_content_rows,
-                            )?;
+                        let consumed = if in_alternate_screen {
+                            renderer.row_offset as usize
                         } else {
-                            // During offset phase, use plain render (no scroll regions)
-                            renderer.render(stdout, vt)?;
+                            need.min(renderer.row_offset as usize)
+                        };
+                        if consumed > 0 {
+                            Renderer::scroll_region(stdout, content_rows, consumed)?;
+                            renderer.row_offset -= consumed as u16;
+                            renderer.invalidate();
                         }
+                    }
+
+                    if in_alternate_screen || renderer.row_offset > 0 {
+                        renderer.render(stdout, vt)?;
                     } else {
-                        let content_rows = self.pty_size().rows;
-                        renderer.render_with_scroll(stdout, vt, total_scroll, content_rows)?;
+                        renderer.render_with_scroll(stdout, vt, total_scroll)?;
                     }
 
                     if self.config.show_status_line {
@@ -930,8 +1025,7 @@ impl ShellSession {
                         if renderer.row_offset > 0 {
                             renderer.render(stdout, vt)?;
                         } else {
-                            let content_rows = self.pty_size().rows;
-                            renderer.render_with_scroll(stdout, vt, scroll_count, content_rows)?;
+                            renderer.render_with_scroll(stdout, vt, scroll_count)?;
                         }
                     }
                     self.draw_status_and_cursor(stdout, vt, renderer)?;
@@ -952,6 +1046,7 @@ impl ShellSession {
                         // Terminal resize ends the offset phase
                         renderer.row_offset = 0;
                         let pty_size = self.pty_size();
+                        renderer.content_rows = pty_size.rows;
                         let _ = pty.resize(pty_size);
                         vt.resize(pty_size.cols as usize, pty_size.rows as usize);
                         renderer.invalidate();
@@ -1073,9 +1168,20 @@ impl ShellSession {
                     }
                 }
                 SequenceEvent::Osc(event) => {
+                    // Forward OSC queries to the real terminal so programs
+                    // can detect color scheme, etc. The terminal's responses
+                    // are filtered from stdin by StdinFilter to prevent them
+                    // from leaking into the shell as garbled text.
                     stdout.write_all(&event.raw_bytes)?;
                 }
                 SequenceEvent::ClearScrollback { raw_bytes } => {
+                    stdout.write_all(&raw_bytes)?;
+                }
+                SequenceEvent::PrimaryDA { raw_bytes } => {
+                    // Forward to the real terminal. The terminal's DA1 response
+                    // arrives on stdin, passes through StdinFilter (it's CSI,
+                    // not OSC), gets written to the PTY, and reaches the
+                    // program that sent the query.
                     stdout.write_all(&raw_bytes)?;
                 }
             }
