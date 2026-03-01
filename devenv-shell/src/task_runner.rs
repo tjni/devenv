@@ -307,9 +307,14 @@ impl PtyTaskRunner {
         &self,
         task_rx: &mut mpsc::Receiver<PtyTaskRequest>,
         vt: &mut avt::Vt,
+        pty_ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<(), TaskRunnerError> {
-        // Wait for shell to be ready
+        // Wait for shell to be ready before signaling task dispatch
         self.wait_for_shell_ready_with_vt(vt).await?;
+
+        if let Some(tx) = pty_ready_tx {
+            let _ = tx.send(());
+        }
 
         tracing::trace!("run_with_vt: waiting for task requests");
         self.disable_prompt_command()?;

@@ -382,15 +382,15 @@ impl ShellSession {
 
         // Handle TUI handoff if present
         if let Some(mut handoff) = handoff {
-            // Signal that PTY is ready for tasks
-            if let Some(tx) = handoff.pty_ready_tx.take() {
-                let _ = tx.send(());
-            }
-
             // Run any tasks in the PTY (TUI still active, showing progress)
             if let Some(mut task_rx) = handoff.task_rx.take() {
                 let task_runner = PtyTaskRunner::new(Arc::clone(&pty));
-                task_runner.run_with_vt(&mut task_rx, &mut vt).await?;
+                let pty_ready_tx = handoff.pty_ready_tx.take();
+                task_runner
+                    .run_with_vt(&mut task_rx, &mut vt, pty_ready_tx)
+                    .await?;
+            } else if let Some(tx) = handoff.pty_ready_tx.take() {
+                let _ = tx.send(());
             }
 
             // Clear VT so internal task output (env exports, markers, drain
