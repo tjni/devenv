@@ -73,6 +73,12 @@ pub enum SequenceEvent {
     ClearScrollback {
         raw_bytes: Vec<u8>,
     },
+    /// CSI c or CSI 0 c — Primary Device Attributes request.
+    /// Programs send this to discover terminal type; crossterm also uses it
+    /// as a sync marker to terminate pending capability queries.
+    PrimaryDA {
+        raw_bytes: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,9 +177,18 @@ impl EscapeScanner {
                                 events.push(SequenceEvent::DecMode(event));
                                 self.state = RouterState::Ground;
                             }
-                            DecModeResult::Reject => {
-                                // Not a DEC private mode. Try standard CSI.
-                                if byte.is_ascii_digit() {
+                            DecModeResult::Reject { private } => {
+                                if private {
+                                    // Had `?` prefix — this is a DEC-private sequence
+                                    // with an unrecognized final byte (e.g. DA1
+                                    // response `CSI ? 62 c`). Don't misinterpret it.
+                                    self.reset();
+                                } else if byte == b'c' {
+                                    // DA1 query with no params (CSI c)
+                                    let raw_bytes = std::mem::take(&mut self.seq_bytes);
+                                    events.push(SequenceEvent::PrimaryDA { raw_bytes });
+                                    self.state = RouterState::Ground;
+                                } else if byte.is_ascii_digit() {
                                     self.state = RouterState::CsiStandard;
                                     self.csi_param = (byte - b'0') as u16;
                                 } else {
@@ -197,6 +212,11 @@ impl EscapeScanner {
                                 .checked_mul(10)
                                 .and_then(|v| v.checked_add((byte - b'0') as u16))
                                 .unwrap_or(u16::MAX);
+                        } else if byte == b'c' && self.csi_param == 0 {
+                            // DA1 with explicit zero param (CSI 0 c)
+                            let raw_bytes = std::mem::take(&mut self.seq_bytes);
+                            events.push(SequenceEvent::PrimaryDA { raw_bytes });
+                            self.state = RouterState::Ground;
                         } else if byte == b'J' && self.csi_param == 3 {
                             let raw_bytes = std::mem::take(&mut self.seq_bytes);
                             events.push(SequenceEvent::ClearScrollback { raw_bytes });
@@ -683,5 +703,73 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], SequenceEvent::DecMode(_)));
         assert!(matches!(events[1], SequenceEvent::ClearScrollback { .. }));
+    }
+
+    // -- Primary Device Attributes (DA1) tests --
+
+    #[test]
+    fn detects_da1_no_params() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[c");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::PrimaryDA { ref raw_bytes } = events[0] else {
+            panic!("expected PrimaryDA");
+        };
+        assert_eq!(raw_bytes, b"\x1b[c");
+    }
+
+    #[test]
+    fn detects_da1_with_zero_param() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"\x1b[0c");
+        assert_eq!(events.len(), 1);
+        let SequenceEvent::PrimaryDA { ref raw_bytes } = events[0] else {
+            panic!("expected PrimaryDA");
+        };
+        assert_eq!(raw_bytes, b"\x1b[0c");
+    }
+
+    #[test]
+    fn da1_split_across_buffers() {
+        let mut scanner = EscapeScanner::new();
+
+        let events1 = scanner.scan(b"\x1b[");
+        assert!(events1.is_empty());
+
+        let events2 = scanner.scan(b"c");
+        assert_eq!(events2.len(), 1);
+        assert!(matches!(events2[0], SequenceEvent::PrimaryDA { .. }));
+    }
+
+    #[test]
+    fn da1_interleaved_with_text() {
+        let mut scanner = EscapeScanner::new();
+        let events = scanner.scan(b"hello\x1b[cworld");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], SequenceEvent::PrimaryDA { .. }));
+    }
+
+    #[test]
+    fn da1_does_not_match_nonzero_param() {
+        let mut scanner = EscapeScanner::new();
+        // CSI 1 c is not DA1
+        let events = scanner.scan(b"\x1b[1c");
+        assert!(events.is_empty());
+        // Scanner recovers
+        let events = scanner.scan(b"\x1b[c");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], SequenceEvent::PrimaryDA { .. }));
+    }
+
+    #[test]
+    fn da1_response_not_misdetected_as_query() {
+        let mut scanner = EscapeScanner::new();
+        // CSI ? 62 c is a DA1 *response*, not a query — must not emit PrimaryDA
+        let events = scanner.scan(b"\x1b[?62c");
+        assert!(events.is_empty());
+        // Scanner recovers
+        let events = scanner.scan(b"\x1b[c");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], SequenceEvent::PrimaryDA { .. }));
     }
 }

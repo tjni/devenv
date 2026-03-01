@@ -15,7 +15,12 @@ pub enum DecModeAction {
 pub enum DecModeResult {
     Pending,
     Complete(DecModeAction),
-    Reject,
+    /// Rejected: not a valid DEC private mode sequence.
+    /// `private` is true if `?` was already consumed (i.e., the sequence
+    /// started as DEC private but had an unexpected final byte).
+    Reject {
+        private: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +53,7 @@ impl DecModeParser {
                     self.current_param = Some(0);
                     DecModeResult::Pending
                 } else {
-                    DecModeResult::Reject
+                    DecModeResult::Reject { private: false }
                 }
             }
             State::Params => match byte {
@@ -65,11 +70,11 @@ impl DecModeParser {
                         self.current_param = Some(0);
                         DecModeResult::Pending
                     }
-                    _ => DecModeResult::Reject,
+                    _ => DecModeResult::Reject { private: true },
                 },
                 b'h' => self.finish(|modes| DecModeAction::Set { modes }),
                 b'l' => self.finish(|modes| DecModeAction::Reset { modes }),
-                _ => DecModeResult::Reject,
+                _ => DecModeResult::Reject { private: true },
             },
         }
     }
@@ -85,7 +90,7 @@ impl DecModeParser {
                 self.current_param = Some(0);
                 DecModeResult::Complete(make_action(modes))
             }
-            _ => DecModeResult::Reject,
+            _ => DecModeResult::Reject { private: true },
         }
     }
 
@@ -109,7 +114,10 @@ mod tests {
     #[test]
     fn rejects_without_question_mark() {
         let mut p = DecModeParser::new();
-        assert!(matches!(p.feed(b'1'), DecModeResult::Reject));
+        assert!(matches!(
+            p.feed(b'1'),
+            DecModeResult::Reject { private: false }
+        ));
     }
 
     #[test]
@@ -188,7 +196,10 @@ mod tests {
         let mut p = DecModeParser::new();
         p.feed(b'?');
         p.feed(b'1');
-        assert!(matches!(p.feed(b'x'), DecModeResult::Reject));
+        assert!(matches!(
+            p.feed(b'x'),
+            DecModeResult::Reject { private: true }
+        ));
     }
 
     #[test]
@@ -198,7 +209,10 @@ mod tests {
         for &b in b"99999" {
             assert!(matches!(p.feed(b), DecModeResult::Pending));
         }
-        assert!(matches!(p.feed(b'h'), DecModeResult::Reject));
+        assert!(matches!(
+            p.feed(b'h'),
+            DecModeResult::Reject { private: true }
+        ));
     }
 
     #[test]
@@ -210,7 +224,10 @@ mod tests {
             assert!(matches!(p.feed(b';'), DecModeResult::Pending));
         }
         p.feed(b'1');
-        assert!(matches!(p.feed(b';'), DecModeResult::Reject));
+        assert!(matches!(
+            p.feed(b';'),
+            DecModeResult::Reject { private: true }
+        ));
     }
 
     #[test]
