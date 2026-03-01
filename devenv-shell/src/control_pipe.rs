@@ -56,13 +56,11 @@ impl ControlPipe {
 
     /// Open the read end and return a receiver.
     ///
-    /// Opens in read-write mode so the open does not block waiting for
-    /// a writer. The receiver is fully async (epoll-based), so it can
-    /// be used in `tokio::select!` with other futures.
+    /// The FIFO is opened read-only with `O_NONBLOCK` (tokio's default),
+    /// so the open returns immediately even if no writer is connected yet.
+    /// Async reads will wait for data via kqueue/epoll.
     pub fn into_receiver(self) -> io::Result<ControlPipeReceiver> {
-        let reader = pipe::OpenOptions::new()
-            .read_write(true)
-            .open_receiver(self.path())?;
+        let reader = pipe::OpenOptions::new().open_receiver(self.path())?;
         let buf_reader = BufReader::new(reader);
 
         Ok(ControlPipeReceiver {
