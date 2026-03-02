@@ -1,26 +1,45 @@
 use crate::{
     components::{LOG_VIEWPORT_FAILED, LOG_VIEWPORT_SHOW_OUTPUT, *},
     model::{
-        Activity, ActivityModel, ActivitySummary, ActivityVariant, NixActivityState,
-        ProcessLifecycle, RenderContext, TaskDisplayStatus, TerminalSize, UiState,
+        Activity, ActivityModel, ActivitySummary, ActivityVariant, DisplayActivity,
+        NixActivityState, ProcessLifecycle, RenderContext, TaskDisplayStatus, TerminalSize,
+        UiState,
     },
 };
 use devenv_activity::ActivityLevel;
 use human_repr::{HumanCount, HumanDuration};
 use iocraft::Context;
 use iocraft::components::ContextProvider;
+use iocraft::hooks::UseComponentRect;
 use iocraft::prelude::*;
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Height reserved for the bottom summary bar (1 line content + 1 line margin_top).
+pub const SUMMARY_BAR_HEIGHT: u16 = 2;
+
+/// Map from activity_id to rendered height in lines.
+pub type ActivityHeights = Ref<HashMap<u64, i32>>;
+
+/// Pre-computed state passed from the app to avoid redundant computation in `view()`.
+pub struct ScrollState {
+    pub handle: Option<Ref<ScrollViewHandle>>,
+    pub display_activities: Vec<DisplayActivity>,
+}
 
 /// Main view function that creates the UI
 pub fn view(
     model: &ActivityModel,
     ui_state: &UiState,
     render_context: RenderContext,
+    scroll: Option<ScrollState>,
 ) -> impl Into<AnyElement<'static>> {
-    let active_activities = model.get_display_activities();
+    let (scroll_handle, active_activities) = match scroll {
+        Some(s) => (s.handle, s.display_activities),
+        None => (None, model.get_display_activities()),
+    };
 
     let summary = model.calculate_summary();
     let selected_id = ui_state.selected_activity;
@@ -130,22 +149,40 @@ pub fn view(
     }
     .into_any();
 
+    // Build the activity list element
+    let activity_list = element! {
+        View(flex_direction: FlexDirection::Column, width: 100pct) {
+            #(activity_elements)
+        }
+    }
+    .into_any();
+
     let mut children = vec![];
 
-    // Task activities are now included in the regular activity list
-    // No separate task bar needed
-
-    // Activity list (with inline logs)
-    children.push(
-        element! {
-            View(flex_grow: 1.0, width: 100pct) {
-                View(flex_direction: FlexDirection::Column, width: 100pct) {
-                    #(activity_elements)
+    // Activity list: wrap in ScrollView for Normal render with scroll_handle,
+    // use plain layout for Final render
+    if let Some(handle) = scroll_handle {
+        let scroll_height = terminal_size.height.saturating_sub(SUMMARY_BAR_HEIGHT) as u32;
+        children.push(
+            element! {
+                View(height: scroll_height) {
+                    ScrollView(auto_scroll: true, keyboard_scroll: false, handle: handle) {
+                        #(activity_list)
+                    }
                 }
             }
-        }
-        .into_any(),
-    );
+            .into_any(),
+        );
+    } else {
+        children.push(
+            element! {
+                View(flex_grow: 1.0, width: 100pct) {
+                    #(activity_list)
+                }
+            }
+            .into_any(),
+        );
+    }
 
     // Summary line at bottom (only in normal render context)
     if show_summary {
@@ -167,7 +204,13 @@ pub fn view(
 
     element! {
         ContextProvider(value: Context::owned(terminal_size)) {
-            View(flex_direction: FlexDirection::Column, max_height: terminal_size.height as u32, width: 100pct, overflow: Overflow::Hidden, justify_content: JustifyContent::FlexEnd) {
+            View(
+                flex_direction: FlexDirection::Column,
+                max_height: terminal_size.height as u32,
+                width: 100pct,
+                overflow: Overflow::Hidden,
+                justify_content: JustifyContent::FlexEnd,
+            ) {
                 #(children)
             }
         }
@@ -213,9 +256,19 @@ fn build_activity_prefix(
 
 /// Render a single activity (owned version)
 #[component]
-fn ActivityItem(hooks: Hooks) -> impl Into<AnyElement<'static>> {
+fn ActivityItem(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let terminal_width = hooks.use_context::<TerminalSize>().width;
     let ctx = hooks.use_context::<ActivityRenderContext>();
+
+    // Measure rendered height and report it to the shared heights map.
+    // Copy the iocraft Ref (which is Copy) out of the cell::Ref so we can call write().
+    let heights = hooks.try_use_context::<ActivityHeights>().map(|r| *r);
+    let rect = hooks.use_component_rect();
+    if let (Some(mut heights), Some(rect)) = (heights, rect) {
+        let height = rect.bottom.saturating_sub(rect.top);
+        heights.write().insert(ctx.activity.id, height);
+    }
+
     let ActivityRenderContext {
         activity,
         depth,

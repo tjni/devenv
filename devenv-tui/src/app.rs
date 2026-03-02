@@ -1,7 +1,7 @@
 use crate::{
     expanded_view::ExpandedLogView,
     model::{ActivityModel, RenderContext, UiState, ViewMode},
-    view::view,
+    view::{ActivityHeights, SUMMARY_BAR_HEIGHT, ScrollState, view},
 };
 use crossterm::{
     cursor, event, execute,
@@ -291,7 +291,7 @@ impl TuiApp {
 
                     let mut element = element! {
                         View(width: terminal_width) {
-                            #(vec![view(&model_guard, &ui, RenderContext::Final).into()])
+                            #(vec![view(&model_guard, &ui, RenderContext::Final, None).into()])
                         }
                     };
                     let canvas = element.render(Some(terminal_width as usize));
@@ -403,6 +403,39 @@ pub fn restore_terminal() {
     let _ = stderr.flush();
 }
 
+fn activity_height(heights: &std::collections::HashMap<u64, i32>, id: u64) -> i32 {
+    heights.get(&id).copied().unwrap_or(1)
+}
+
+/// Scroll the viewport so the selected activity is visible.
+fn scroll_selected_into_view(
+    handle: &mut ScrollViewHandle,
+    heights: &std::collections::HashMap<u64, i32>,
+    display_activities: &[crate::model::DisplayActivity],
+    selected_id: u64,
+) {
+    let Some(position) = display_activities
+        .iter()
+        .position(|da| da.activity.id == selected_id)
+    else {
+        return;
+    };
+
+    let offset: i32 = display_activities[..position]
+        .iter()
+        .map(|da| activity_height(heights, da.activity.id))
+        .sum();
+    let target_height = activity_height(heights, selected_id);
+
+    let vp = handle.viewport_height() as i32;
+    let current = handle.scroll_offset() as i32;
+    if offset < current {
+        handle.scroll_to(offset);
+    } else if offset + target_height > current + vp {
+        handle.scroll_to(offset + target_height - vp);
+    }
+}
+
 /// Main TUI component (inline mode)
 #[component]
 fn MainView(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
@@ -414,6 +447,10 @@ fn MainView(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut should_exit = hooks.use_state(|| false);
     let shutdown = hooks.use_context::<Arc<Shutdown>>();
     let mut system = hooks.use_context_mut::<SystemContext>();
+
+    // ScrollView handle and per-activity height measurements
+    let scroll_handle = hooks.use_ref_default::<ScrollViewHandle>();
+    let mut activity_heights: ActivityHeights = hooks.use_ref_default();
 
     // Redraw when notified of activity model changes (throttled)
     let redraw = hooks.use_state(|| 0u64);
@@ -447,6 +484,7 @@ fn MainView(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         let ui_state = ui_state.clone();
         let shutdown = shutdown.clone();
         let command_tx = command_tx.clone();
+        let mut scroll_handle = scroll_handle;
 
         move |event| {
             if let TerminalEvent::Key(key_event) = event
@@ -485,21 +523,25 @@ fn MainView(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                             should_exit.set(true);
                         }
                     }
-                    KeyCode::Down => {
-                        // Get selectable IDs from activity model (read-only)
+                    KeyCode::Down | KeyCode::Up => {
                         if let Ok(model) = activity_model.read() {
                             let selectable = model.get_selectable_activity_ids();
                             if let Ok(mut ui) = ui_state.write() {
-                                ui.select_next_activity(&selectable);
-                            }
-                        }
-                    }
-                    KeyCode::Up => {
-                        // Get selectable IDs from activity model (read-only)
-                        if let Ok(model) = activity_model.read() {
-                            let selectable = model.get_selectable_activity_ids();
-                            if let Ok(mut ui) = ui_state.write() {
-                                ui.select_previous_activity(&selectable);
+                                if key_event.code == KeyCode::Down {
+                                    ui.select_next_activity(&selectable);
+                                } else {
+                                    ui.select_previous_activity(&selectable);
+                                }
+                                if let Some(selected_id) = ui.selected_activity {
+                                    let display = model.get_display_activities();
+                                    let heights = activity_heights.read();
+                                    scroll_selected_into_view(
+                                        &mut scroll_handle.write(),
+                                        &heights,
+                                        &display,
+                                        selected_id,
+                                    );
+                                }
                             }
                         }
                     }
@@ -507,6 +549,7 @@ fn MainView(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         if let Ok(mut ui) = ui_state.write() {
                             ui.selected_activity = None;
                         }
+                        scroll_handle.write().scroll_to_bottom();
                     }
                     _ => {}
                 }
@@ -524,20 +567,47 @@ fn MainView(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     // Render the view - read activity model briefly, UI state separately
     let ui = ui_state.read().unwrap();
     let (rendered, last_render_height) = if let Ok(model_guard) = activity_model.read() {
-        let mut measure = element! {
-            View(width: terminal_width) {
-                #(vec![view(&model_guard, &ui, RenderContext::Normal).into()])
-            }
+        let display = model_guard.get_display_activities();
+
+        // Prune stale entries and compute total content height in a single lock
+        let total_content_height: i32 = {
+            let active_ids: std::collections::HashSet<u64> =
+                display.iter().map(|da| da.activity.id).collect();
+            let mut heights = activity_heights.write();
+            heights.retain(|id, _| active_ids.contains(id));
+            display
+                .iter()
+                .map(|da| activity_height(&heights, da.activity.id))
+                .sum()
         };
-        let height = measure.render(Some(terminal_width as usize)).height() as u16;
+
+        // Only enable ScrollView when content exceeds available terminal height.
+        let available_height = terminal_height.saturating_sub(SUMMARY_BAR_HEIGHT) as i32;
+        let scroll_handle_opt = if total_content_height > available_height {
+            Some(scroll_handle)
+        } else {
+            None
+        };
+
         let rendered = element! {
-            View(width: terminal_width) {
-                #(vec![view(&model_guard, &ui, RenderContext::Normal).into()])
+            ContextProvider(value: iocraft::Context::owned(activity_heights)) {
+                View(width: terminal_width) {
+                    #(vec![view(&model_guard, &ui, RenderContext::Normal, Some(ScrollState { handle: scroll_handle_opt, display_activities: display })).into()])
+                }
             }
         };
+        // Height is computed by iocraft's render loop; use terminal height as
+        // the upper bound for clearing purposes (the inline renderer already
+        // tracks the actual painted height).
+        let height = terminal_height;
         (rendered, height)
     } else {
-        (element!(View(width: terminal_width)), 0)
+        (
+            element!(ContextProvider(value: iocraft::Context::owned(activity_heights)) {
+                View(width: terminal_width)
+            }),
+            0,
+        )
     };
     drop(ui);
     if let Ok(mut ui) = ui_state.write() {
@@ -605,7 +675,7 @@ async fn run_view(
                 let (terminal_width, _) = crossterm::terminal::size().unwrap_or((80, 24));
                 let mut normal_view = element! {
                     View(width: terminal_width) {
-                        #(vec![view(&model, &ui, RenderContext::Normal).into()])
+                        #(vec![view(&model, &ui, RenderContext::Normal, None).into()])
                     }
                 };
                 normal_view.render(Some(terminal_width as usize)).height() as u16
