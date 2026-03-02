@@ -417,7 +417,7 @@ impl StatusLine {
             element! {
                 View(width: width as u32, height: 1, flex_direction: FlexDirection::Row, justify_content: JustifyContent::SpaceBetween, padding_left: 1, padding_right: 1) {
                     View(flex_direction: FlexDirection::Row, flex_grow: 1.0, min_width: 0, overflow: Overflow::Hidden) {
-                        View(margin_right: 1) {
+                        View(margin_right: 2) {
                             Text(content: XMARK, color: COLOR_FAILED)
                         }
                         Text(content: "devenv ", color: COLOR_SECONDARY)
@@ -455,7 +455,7 @@ impl StatusLine {
             element! {
                 View(width: width as u32, height: 1, flex_direction: FlexDirection::Row, justify_content: JustifyContent::SpaceBetween, padding_left: 1, padding_right: 1) {
                     View(flex_direction: FlexDirection::Row, flex_grow: 1.0, min_width: 0, overflow: Overflow::Hidden) {
-                        View(margin_right: 1) {
+                        View(margin_right: 2) {
                             Text(content: "⏸", color: COLOR_SECONDARY)
                         }
                         Text(content: "devenv ", color: COLOR_SECONDARY)
