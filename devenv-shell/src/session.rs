@@ -453,7 +453,7 @@ impl ShellSession {
     /// Create a new shell session with the given configuration.
     pub fn new(config: SessionConfig) -> Self {
         let size = config.size.unwrap_or_else(get_terminal_size);
-        let mut status_line = StatusLine::with_defaults();
+        let mut status_line = StatusLine::new();
         status_line.set_enabled(config.show_status_line);
 
         Self {
@@ -512,7 +512,7 @@ impl ShellSession {
             }) => {
                 self.status_line
                     .state_mut()
-                    .set_message(format!("Watching {} files", watch_files.len()));
+                    .set_watched_file_count(watch_files.len());
                 (command, watch_files)
             }
             Some(ShellCommand::Shutdown) | None => {
@@ -1100,7 +1100,9 @@ impl ShellSession {
             }
 
             ShellCommand::WatchedFiles { files } => {
-                self.status_line.state_mut().set_watched_files(files);
+                self.status_line
+                    .state_mut()
+                    .set_watched_file_count(files.len());
             }
 
             ShellCommand::WatchingPaused { paused } => {
